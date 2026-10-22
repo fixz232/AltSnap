@@ -172,6 +172,32 @@ typedef struct tagMSAAMENUINFO {
 #   define LWA_ALPHA 0x00000002
 #endif
 
+#ifndef WDA_NONE
+#   define WDA_NONE 0x00000000
+#   define WDA_MONITOR 0x00000001
+#   define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
+#ifndef DWM_TNP_RECTDESTINATION
+typedef HANDLE HTHUMBNAIL;
+typedef HTHUMBNAIL *PHTHUMBNAIL;
+
+#   define DWM_TNP_RECTDESTINATION 0x00000001
+#   define DWM_TNP_RECTSOURCE 0x00000002
+#   define DWM_TNP_OPACITY 0x00000004
+#   define DWM_TNP_VISIBLE 0x00000008
+#   define DWM_TNP_SOURCECLIENTAREAONLY 0x00000010
+
+typedef struct _DWM_THUMBNAIL_PROPERTIES {
+    DWORD dwFlags;
+    RECT rcDestination;
+    RECT rcSource;
+    BYTE opacity;
+    BOOL fVisible;
+    BOOL fSourceClientAreaOnly;
+} DWM_THUMBNAIL_PROPERTIES, *PDWM_THUMBNAIL_PROPERTIES;
+#endif
+
 #ifndef WM_XBUTTONDOWN
 #   define GET_WHEEL_DELTA_WPARAM(wParam) ((short)HIWORD(wParam))
 #   define WM_XBUTTONDOWN 0x020B
@@ -614,19 +640,159 @@ static BOOL SetLayeredWindowAttributesL(HWND hwnd, COLORREF crKey, BYTE bAlpha, 
     return FALSE;
 }
 
-/* Helper to set alpha and automatically add/remove WS_EX_LAYERED attrib */
-static void SetWindowAlpha(HWND hwnd, BYTE alpha)
+static BOOL SetWindowDisplayAffinityL(HWND hwnd, DWORD affinity)
 {
-    /*LOGA("Setting ALPHA to %d", (int)alpha);*/
-    LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-    if (alpha == 255) {
-        if ( exstyle&WS_EX_LAYERED ) /* Remove layered attribute if opacity is 100% */
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle & ~WS_EX_LAYERED);
-    } else {
-        if ( !(exstyle&WS_EX_LAYERED) ) /* Add Layered attribute if needed */
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle|WS_EX_LAYERED);
-        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    typedef BOOL (WINAPI *funk_t)(HWND hwnd, DWORD affinity);
+    static funk_t funk = (funk_t)IPTR;
+
+    if (funk == (funk_t)IPTR)
+        funk = (funk_t)LoadDLLProc("USER32.DLL", "SetWindowDisplayAffinity");
+    if (funk)
+        return funk(hwnd, affinity);
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return FALSE;
+}
+
+typedef struct window_alpha_state {
+    HWND hwnd;
+    HANDLE generation;
+    UCHAR had_layered;
+    UCHAR alpha_owned;
+    COLORREF color_key;
+    BYTE alpha;
+    DWORD flags;
+} window_alpha_state_t;
+
+static BOOL SetWindowLayeredStyle(HWND hwnd, BOOL enabled)
+{
+    LONG_PTR current = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    LONG_PTR desired = enabled ? current | WS_EX_LAYERED : current & ~WS_EX_LAYERED;
+    if (current == desired)
+        return TRUE;
+
+    SetLastError(ERROR_SUCCESS);
+    LONG_PTR previous = SetWindowLongPtr(hwnd, GWL_EXSTYLE, desired);
+    if (!previous && GetLastError() != ERROR_SUCCESS)
+        return FALSE;
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    return TRUE;
+}
+
+static BOOL CaptureWindowAlphaState(HWND hwnd, window_alpha_state_t *state)
+{
+    mem00(state, sizeof(*state));
+    if (!IsWindow(hwnd))
+        return FALSE;
+
+    state->hwnd = hwnd;
+    state->had_layered = !!(GetWindowLongPtr(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED);
+    state->alpha_owned = !!GetProp(hwnd, APP_ALPHAOWNED);
+    state->alpha = 255;
+    if (state->had_layered && !GetLayeredWindowAttributes(hwnd,
+            &state->color_key, &state->alpha, &state->flags)) {
+        state->hwnd = NULL;
+        return FALSE;
     }
+    state->generation = (HANDLE)state;
+    if (!SetProp(hwnd, APP_ALPHASTATEGEN, state->generation)) {
+        state->hwnd = NULL;
+        state->generation = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL RestoreWindowAlphaState(const window_alpha_state_t *state)
+{
+    if (!state->hwnd || !IsWindow(state->hwnd) || !state->generation
+        || GetProp(state->hwnd, APP_ALPHASTATEGEN) != state->generation)
+        return FALSE;
+
+    BOOL ok;
+    if (state->had_layered) {
+        ok = SetWindowLayeredStyle(state->hwnd, TRUE)
+            && SetLayeredWindowAttributes(state->hwnd, state->color_key,
+                state->alpha, state->flags);
+    } else {
+        ok = SetWindowLayeredStyle(state->hwnd, FALSE);
+    }
+    if (ok) {
+        if (state->alpha_owned)
+            ok = SetProp(state->hwnd, APP_ALPHAOWNED, (HANDLE)(UINT_PTR)1);
+        else
+            RemoveProp(state->hwnd, APP_ALPHAOWNED);
+    }
+    if (GetProp(state->hwnd, APP_ALPHASTATEGEN) == state->generation)
+        RemoveProp(state->hwnd, APP_ALPHASTATEGEN);
+    return ok;
+}
+
+static void DiscardWindowAlphaState(window_alpha_state_t *state)
+{
+    if (state->hwnd && IsWindow(state->hwnd) && state->generation
+        && GetProp(state->hwnd, APP_ALPHASTATEGEN) == state->generation) {
+        RemoveProp(state->hwnd, APP_ALPHASTATEGEN);
+    }
+    mem00(state, sizeof(*state));
+}
+
+/* Safely query opacity without touching UpdateLayeredWindow-based windows. */
+static BOOL GetWindowAlpha(HWND hwnd, BYTE *alpha)
+{
+    LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (!(exstyle & WS_EX_LAYERED)) {
+        *alpha = 255;
+        return TRUE;
+    }
+
+    COLORREF color_key = 0;
+    BYTE current_alpha = 255;
+    DWORD flags = 0;
+    if (!GetLayeredWindowAttributes(hwnd, &color_key, &current_alpha, &flags))
+        return FALSE;
+
+    *alpha = (flags & LWA_ALPHA) ? current_alpha : 255;
+    return TRUE;
+}
+
+/* Set alpha while preserving existing layered-window flags and ownership. */
+static BOOL SetWindowAlpha(HWND hwnd, BYTE alpha)
+{
+    LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (exstyle & WS_EX_LAYERED) {
+        COLORREF color_key = 0;
+        BYTE old_alpha = 255;
+        DWORD flags = 0;
+        if (!GetLayeredWindowAttributes(hwnd, &color_key, &old_alpha, &flags))
+            return FALSE;
+
+        if (alpha == 255 && GetProp(hwnd, APP_ALPHAOWNED)) {
+            if (!SetWindowLayeredStyle(hwnd, FALSE))
+                return FALSE;
+            RemoveProp(hwnd, APP_ALPHAOWNED);
+            return TRUE;
+        }
+        return SetLayeredWindowAttributes(hwnd, color_key, alpha, flags | LWA_ALPHA);
+    }
+
+    if (alpha == 255) {
+        RemoveProp(hwnd, APP_ALPHAOWNED);
+        return TRUE;
+    }
+    if (!SetProp(hwnd, APP_ALPHAOWNED, (HANDLE)(UINT_PTR)1))
+        return FALSE;
+
+    if (!SetWindowLayeredStyle(hwnd, TRUE)) {
+        RemoveProp(hwnd, APP_ALPHAOWNED);
+        return FALSE;
+    }
+    if (!SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)) {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle);
+        RemoveProp(hwnd, APP_ALPHAOWNED);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL GetMonitorInfoL(HMONITOR hMonitor, LPMONITORINFO lpmi)
@@ -1037,6 +1203,44 @@ static HRESULT DwmSetWindowAttributeL(HWND hwnd, DWORD a, PVOID b, DWORD c)
     }
     /* myDwmSetWindowAttribute return 0 on sucess ! */
     return 666; /* Here we FAIL with 666 error    */
+}
+
+static HRESULT DwmRegisterThumbnailL(HWND destination, HWND source, HTHUMBNAIL *thumbnail)
+{
+    typedef HRESULT (WINAPI *funk_t)(HWND destination, HWND source, HTHUMBNAIL *thumbnail);
+    static funk_t funk = (funk_t)IPTR;
+
+    if (funk == (funk_t)IPTR)
+        funk = (funk_t)LoadDLLProc("DWMAPI.DLL", "DwmRegisterThumbnail");
+    if (funk)
+        return funk(destination, source, thumbnail);
+    return 666;
+}
+
+static HRESULT DwmUpdateThumbnailPropertiesL(HTHUMBNAIL thumbnail,
+    const DWM_THUMBNAIL_PROPERTIES *properties)
+{
+    typedef HRESULT (WINAPI *funk_t)(HTHUMBNAIL thumbnail,
+        const DWM_THUMBNAIL_PROPERTIES *properties);
+    static funk_t funk = (funk_t)IPTR;
+
+    if (funk == (funk_t)IPTR)
+        funk = (funk_t)LoadDLLProc("DWMAPI.DLL", "DwmUpdateThumbnailProperties");
+    if (funk)
+        return funk(thumbnail, properties);
+    return 666;
+}
+
+static HRESULT DwmUnregisterThumbnailL(HTHUMBNAIL thumbnail)
+{
+    typedef HRESULT (WINAPI *funk_t)(HTHUMBNAIL thumbnail);
+    static funk_t funk = (funk_t)IPTR;
+
+    if (funk == (funk_t)IPTR)
+        funk = (funk_t)LoadDLLProc("DWMAPI.DLL", "DwmUnregisterThumbnail");
+    if (funk)
+        return funk(thumbnail);
+    return 666;
 }
 
 static HRESULT DwmGetColorizationColorL(DWORD *a, BOOL *b)

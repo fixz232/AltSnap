@@ -1,11 +1,17 @@
 #ifndef ALTDRAG_RPC_H
 #define ALTDRAG_RPC_H
 
-//#define UNICODE
-//#define _UNICODE
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #define _WIN32_WINNT 0x0600
 #define WINVER 0x0600
 #include <windows.h>
+#define APP_ALPHAOWNED TEXT("ShengZiMao-AlphaOwned")
+#define APP_ALPHASTATEGEN TEXT("ShengZiMao-AlphaStateGeneration")
 #include "unfuck.h"
 
 #ifdef UNICODE
@@ -36,6 +42,7 @@
 #define CMD_SNAPLAYOUTEND (422)
 #define CMD_EDITLAYOUT    (430)
 #define CMD_CLOSEZONES    (431)
+#define CMD_WINDOWTOOL    (432)
 
 
 #ifndef LOW_LEVEL_KB_PROC
@@ -60,8 +67,8 @@
 #define LP_NOALTACTION (1<<6)
 
 // App
-#define APP_NAME       TEXT("AltSnap")
-#define APP_NAMEA      "AltSnap"
+#define APP_NAME       TEXT("圣子猫透明窗体")
+#define APP_NAMEA      "圣子猫透明窗体"
 #define APP_PROPPT     APP_NAME TEXT("-RDim")
 #define APP_PROPFL     APP_NAME TEXT("-RFlag")
 #define APP_PROPOFFSET APP_NAME TEXT("-ROffset")
@@ -94,6 +101,7 @@
 #define WM_GETBESTLAYOUT  (WM_USER+18)
 //#define WM_GETZONESLEN    (WM_USER+19)
 #define WM_GETZONES       (WM_USER+20)
+#define WM_HOOKERROR      (WM_USER+21)
 
 // List of possible actions
 // ACVALUE(AC_ENUM, IniString, Info)

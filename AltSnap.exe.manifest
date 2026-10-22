@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:v3="urn:schemas-microsoft-com:asm.v3">
-<assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="XP style" type="win32" />
+<assemblyIdentity version="1.68.2.0" processorArchitecture="*" name="ShengZiMao.TransparentWindow" type="win32" />
 <v3:trustInfo><v3:security>
   <v3:requestedPrivileges><v3:requestedExecutionLevel level="asInvoker" uiAccess="false" /></v3:requestedPrivileges>
 </v3:security></v3:trustInfo>

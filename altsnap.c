@@ -7,14 +7,34 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #include "hooks.h"
+#include "resource.h"
+
+#ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+#define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
+#define CONFIG_PATH_CHARS 32768
 
 // Boring stuff
 static HINSTANCE g_hinst = NULL;
 static HWND g_hwnd = NULL;
 static UINT WM_TASKBARCREATED = 0;
-static TCHAR inipath[MAX_PATH];
+static TCHAR inipath[CONFIG_PATH_CHARS];
+static TCHAR hookspath[CONFIG_PATH_CHARS];
 
 static WNDPROC G_HotKeyProc = NULL;
+typedef WNDPROC (WINAPI *hooks_load_proc_t)(HWND, const TCHAR *);
+typedef void (WINAPI *hooks_unload_proc_t)(void);
+static hooks_load_proc_t HooksLoad = NULL;
+static hooks_unload_proc_t HooksUnload = NULL;
+static HOOKPROC HooksKeyboardProc = NULL;
+static BOOL hooks_initialized = FALSE;
+static BOOL hook_requested = TRUE;
+static int showerror = 1;
+static DWORD config_write_error = ERROR_SUCCESS;
 
 // Cool stuff
 HINSTANCE hinstDLL = NULL;
@@ -32,23 +52,359 @@ static BYTE WinVer = 0;
 #define ENABLED() (!!keyhook)
 #define GetWindowRectL(hwnd, rect) GetWindowRectLL(hwnd, rect, SnapGap)
 static void UpdateSettings();
+static void SetWindowToolEnabled(BOOL enabled);
+static BOOL WTApplyCaptureProtection(HWND hwnd);
+
+static BOOL AppendPathPart(TCHAR *path, size_t pathlen, const TCHAR *part)
+{
+    size_t len = lstrlen(path);
+    size_t partlen = lstrlen(part);
+    if (!len || len + partlen + 2 > pathlen) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    if (path[len-1] != TEXT('\\')) {
+        path[len++] = TEXT('\\');
+        path[len] = TEXT('\0');
+    }
+    lstrcpy_s(path + len, pathlen - len, part);
+    return TRUE;
+}
+
+static BOOL EnsureDirectory(const TCHAR *path)
+{
+    DWORD attributes = GetFileAttributes(path);
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+            return TRUE;
+        SetLastError(ERROR_DIRECTORY);
+        return FALSE;
+    }
+    if (CreateDirectory(path, NULL))
+        return TRUE;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static BOOL GetEmbeddedResource(WORD id, const BYTE **data, DWORD *size)
+{
+    HRSRC resource = FindResource(g_hinst, MAKEINTRESOURCE(id), RT_RCDATA);
+    if (!resource)
+        return FALSE;
+    HGLOBAL loaded = LoadResource(g_hinst, resource);
+    if (!loaded)
+        return FALSE;
+    *size = SizeofResource(g_hinst, resource);
+    *data = (const BYTE *)LockResource(loaded);
+    if (!*data || !*size) {
+        SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL FileMatchesData(const TCHAR *path, const BYTE *data, DWORD size)
+{
+    HANDLE file = CreateFile(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    LARGE_INTEGER filesize;
+    BOOL matches = GetFileSizeEx(file, &filesize)
+        && filesize.HighPart == 0 && filesize.LowPart == size;
+    DWORD offset = 0;
+    static BYTE buffer[4096];
+    while (matches && offset < size) {
+        DWORD wanted = min((DWORD)sizeof(buffer), size - offset);
+        DWORD read = 0;
+        if (!ReadFile(file, buffer, wanted, &read, NULL) || read != wanted) {
+            matches = FALSE;
+            break;
+        }
+        for (DWORD i = 0; i < read; i++) {
+            if (buffer[i] != data[offset+i]) {
+                matches = FALSE;
+                break;
+            }
+        }
+        offset += read;
+    }
+    DWORD error = matches ? ERROR_SUCCESS : GetLastError();
+    if (!matches && error == ERROR_SUCCESS)
+        error = ERROR_CRC;
+    CloseHandle(file);
+    SetLastError(error);
+    return matches;
+}
+
+static BOOL WriteDataAtomically(const TCHAR *path, const BYTE *data, DWORD size, BOOL replace)
+{
+    static TCHAR temppath[CONFIG_PATH_CHARS];
+    TCHAR suffix[64];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD error = ERROR_SUCCESS;
+
+    if (lstrlen(path) + ARR_SZ(suffix) >= ARR_SZ(temppath)) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    for (DWORD attempt = 0; attempt < 16; attempt++) {
+        lstrcpy_s(temppath, ARR_SZ(temppath), path);
+        wsprintf(suffix, TEXT(".%lu.%lu.tmp"), GetCurrentProcessId(), GetTickCount()+attempt);
+        lstrcat_s(temppath, ARR_SZ(temppath), suffix);
+        file = CreateFile(temppath, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            error = ERROR_SUCCESS;
+            break;
+        }
+        error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+            return FALSE;
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        SetLastError(error);
+        return FALSE;
+    }
+
+    DWORD offset = 0;
+    while (offset < size) {
+        DWORD written = 0;
+        if (!WriteFile(file, data + offset, size - offset, &written, NULL) || !written) {
+            error = GetLastError();
+            break;
+        }
+        offset += written;
+    }
+    if (offset == size && !FlushFileBuffers(file))
+        error = GetLastError();
+    CloseHandle(file);
+
+    if (offset != size || error != ERROR_SUCCESS) {
+        DeleteFile(temppath);
+        SetLastError(error ? error : ERROR_WRITE_FAULT);
+        return FALSE;
+    }
+
+    DWORD flags = MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0);
+    if (!MoveFileEx(temppath, path, flags)) {
+        error = GetLastError();
+        DeleteFile(temppath);
+        if (!replace && (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS))
+            return TRUE;
+        SetLastError(error);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL WriteEmbeddedResource(WORD id, const TCHAR *path, BOOL replace)
+{
+    const BYTE *data;
+    DWORD size;
+    if (!GetEmbeddedResource(id, &data, &size))
+        return FALSE;
+    if (!replace && GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
+        return TRUE;
+    return WriteDataAtomically(path, data, size, replace);
+}
+
+static BOOL IsFileWritable(const TCHAR *path)
+{
+    HANDLE file = CreateFile(path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return FALSE;
+    CloseHandle(file);
+    return TRUE;
+}
+
+static BOOL GetSidecarIniPath(TCHAR *path, size_t pathlen)
+{
+    DWORD ret = GetModuleFileName(NULL, path, (DWORD)pathlen);
+    if (!ret || ret >= pathlen) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    TCHAR *slash = path;
+    TCHAR *dot = NULL;
+    for (TCHAR *cursor = path; *cursor; cursor++) {
+        if (*cursor == TEXT('\\')) {
+            slash = cursor;
+            dot = NULL;
+        } else if (*cursor == TEXT('.')) {
+            dot = cursor;
+        }
+    }
+    if (dot && dot > slash)
+        *dot = TEXT('\0');
+    if (lstrlen(path) + 5 > pathlen) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    lstrcat_s(path, pathlen, TEXT(".ini"));
+    return TRUE;
+}
+
+static BOOL PrepareUserConfiguration(const TCHAR *sidecar, BOOL copy_sidecar)
+{
+    static TCHAR userpath[CONFIG_PATH_CHARS];
+    DWORD ret = GetEnvironmentVariable(TEXT("APPDATA"), userpath, ARR_SZ(userpath));
+    if (!ret || ret >= ARR_SZ(userpath)) {
+        ret = GetEnvironmentVariable(TEXT("LOCALAPPDATA"), userpath, ARR_SZ(userpath));
+        if (!ret || ret >= ARR_SZ(userpath))
+            return FALSE;
+    }
+    if (!AppendPathPart(userpath, ARR_SZ(userpath), APP_NAME) || !EnsureDirectory(userpath)
+        || !AppendPathPart(userpath, ARR_SZ(userpath), APP_NAME TEXT(".ini")))
+        return FALSE;
+
+    if (GetFileAttributes(userpath) == INVALID_FILE_ATTRIBUTES) {
+        BOOL initialized = FALSE;
+        if (copy_sidecar && sidecar && CopyFile(sidecar, userpath, TRUE)) {
+            DWORD attributes = GetFileAttributes(userpath);
+            if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY))
+                SetFileAttributes(userpath, attributes & ~FILE_ATTRIBUTE_READONLY);
+            initialized = TRUE;
+        }
+        if (!initialized && !WriteEmbeddedResource(IDR_DEFAULT_INI, userpath, FALSE))
+            return FALSE;
+    }
+    if (!IsFileWritable(userpath))
+        return FALSE;
+    lstrcpy_s(inipath, ARR_SZ(inipath), userpath);
+    return TRUE;
+}
+
+static BOOL PrepareConfiguration(void)
+{
+    static TCHAR sidecar[CONFIG_PATH_CHARS];
+    if (GetSidecarIniPath(sidecar, ARR_SZ(sidecar))) {
+        DWORD attributes = GetFileAttributes(sidecar);
+        BOOL exists = attributes != INVALID_FILE_ATTRIBUTES
+            && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+        if (exists && IsFileWritable(sidecar)) {
+            lstrcpy_s(inipath, ARR_SZ(inipath), sidecar);
+            return TRUE;
+        }
+        if (!exists && WriteEmbeddedResource(IDR_DEFAULT_INI, sidecar, FALSE)
+            && IsFileWritable(sidecar)) {
+            lstrcpy_s(inipath, ARR_SZ(inipath), sidecar);
+            return TRUE;
+        }
+        return PrepareUserConfiguration(sidecar, exists);
+    }
+    return PrepareUserConfiguration(NULL, FALSE);
+}
+
+static BOOL WINAPI WriteConfigValue(const TCHAR *section, const TCHAR *key,
+    const TCHAR *value, const TCHAR *path)
+{
+    if (WritePrivateProfileStringW(section, key, value, path))
+        return TRUE;
+    if (config_write_error == ERROR_SUCCESS) {
+        config_write_error = GetLastError();
+        if (config_write_error == ERROR_SUCCESS)
+            config_write_error = ERROR_WRITE_FAULT;
+    }
+    return FALSE;
+}
+
+static void RecordConfigWriteError(DWORD error)
+{
+    if (config_write_error == ERROR_SUCCESS)
+        config_write_error = error ? error : ERROR_WRITE_FAULT;
+}
+
+static void BeginConfigWrite(void)
+{
+    config_write_error = ERROR_SUCCESS;
+}
+
+static BOOL FinishConfigWrite(HWND owner)
+{
+    if (config_write_error == ERROR_SUCCESS)
+        WritePrivateProfileStringW(NULL, NULL, NULL, inipath);
+    if (config_write_error == ERROR_SUCCESS)
+        return TRUE;
+
+    TCHAR message[1024];
+    int len = wsprintf(message,
+        TEXT("设置无法保存，配置文件或系统启动项当前不可写。请检查磁盘空间、文件权限或安全策略。\n\n错误代码：%lu\n配置文件："),
+        config_write_error);
+    lstrcpyn(message + len, inipath, ARR_SZ(message) - len);
+    MessageBox(owner, message, APP_NAME, MB_OK | MB_ICONERROR | MB_TOPMOST);
+    return FALSE;
+}
+
+#undef WritePrivateProfileString
+#define WritePrivateProfileString WriteConfigValue
 
 // Include stuff
 #include "languages.c"
 #include "tray.c"
 #include "config.c"
+#include "windowtool.c"
+
+static BOOL ReadHooksHash(TCHAR hash[65])
+{
+    const BYTE *data;
+    DWORD size;
+    if (!GetEmbeddedResource(IDR_HOOKS_HASH, &data, &size) || size != 64) {
+        SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+    for (DWORD i = 0; i < size; i++) {
+        if (!((data[i] >= '0' && data[i] <= '9') || (data[i] >= 'A' && data[i] <= 'F'))) {
+            SetLastError(ERROR_INVALID_DATA);
+            return FALSE;
+        }
+        hash[i] = (TCHAR)data[i];
+    }
+    hash[64] = TEXT('\0');
+    return TRUE;
+}
+
+static BOOL PrepareHooksPath(void)
+{
+    TCHAR hash[65];
+    DWORD ret = GetEnvironmentVariable(TEXT("LOCALAPPDATA"), hookspath, ARR_SZ(hookspath));
+    if (!ret || ret >= ARR_SZ(hookspath)) {
+        SetLastError(ERROR_ENVVAR_NOT_FOUND);
+        return FALSE;
+    }
+    if (!ReadHooksHash(hash)
+        || !AppendPathPart(hookspath, ARR_SZ(hookspath), APP_NAME)
+        || !EnsureDirectory(hookspath)
+        || !AppendPathPart(hookspath, ARR_SZ(hookspath), TEXT("runtime"))
+        || !EnsureDirectory(hookspath)
+        || !AppendPathPart(hookspath, ARR_SZ(hookspath), hash)
+        || !EnsureDirectory(hookspath)
+        || !AppendPathPart(hookspath, ARR_SZ(hookspath), TEXT("hooks.dll")))
+        return FALSE;
+
+    const BYTE *data;
+    DWORD size;
+    if (!GetEmbeddedResource(IDR_HOOKS_DLL, &data, &size))
+        return FALSE;
+    if (!FileMatchesData(hookspath, data, size)) {
+        if (!WriteDataAtomically(hookspath, data, size, TRUE)
+            || !FileMatchesData(hookspath, data, size))
+            return FALSE;
+    }
+    return TRUE;
+}
 
 static HINSTANCE LoadHooksDLL(void)
 {
-    // Load library
-    TCHAR path[MAX_PATH];
-    DWORD ret = GetModuleFileName(NULL, path, ARR_SZ(path));
-    if(!ret || ret == ARR_SZ(path))
+    if (!PrepareHooksPath())
         return NULL;
-    PathRemoveFileSpecL(path);
-    lstrcat_s(path, ARR_SZ(path), TEXT("\\hooks.dll"));
-    return LoadLibrary(path);
+    return LoadLibraryEx(hookspath, NULL,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 }
+
 static void FreeHooksDLL(void)
 {
     if (hinstDLL) {
@@ -56,42 +412,77 @@ static void FreeHooksDLL(void)
         if (!ret) LOG("FreeLibrary() FAILED!!!");
         hinstDLL = NULL;
     }
+    HooksLoad = NULL;
+    HooksUnload = NULL;
+    HooksKeyboardProc = NULL;
 }
-/////////////////////////////////////////////////////////////////////////////
-static int HookSystem(void)
+
+static void ShowHookError(const TCHAR *reason, DWORD error)
 {
-    if (keyhook) return 1; // System already hooked
+    if (!showerror)
+        return;
+    TCHAR message[1024];
+    int len = wsprintf(message,
+        TEXT("%s\n\n全局窗口控制当前未启用。设置仍可保存，解决问题后点击“应用”会自动重试。\n\n错误代码：%lu"),
+        reason, error ? error : ERROR_GEN_FAILURE);
+    if (hookspath[0] && len + 8 < ARR_SZ(message)) {
+        lstrcat_s(message, ARR_SZ(message), TEXT("\n运行文件："));
+        len = lstrlen(message);
+        lstrcpyn(message + len, hookspath, ARR_SZ(message) - len);
+    }
+    MessageBox(g_cfgwnd ? g_cfgwnd : g_hwnd, message, APP_NAME,
+        MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
+static BOOL FailHookSystem(const TCHAR *reason, DWORD error)
+{
+    ShowHookError(reason, error);
+    UpdateTray();
+    return FALSE;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+static BOOL HookSystem(void)
+{
+    if (keyhook)
+        return TRUE;
     LOG("Going to Hook the system...");
 
     if (!hinstDLL) {
         hinstDLL = LoadHooksDLL();
         if (!hinstDLL) {
-            LOG("Could not load HOOKS.DLL!!!");
-            return 1;
+            DWORD error = GetLastError();
+            LOG("Could not load embedded HOOKS.DLL!!!");
+            return FailHookSystem(TEXT("无法释放或加载内置全局控制组件。"), error);
         }
     }
-    WNDPROC (WINAPI *Load)(HWND, const TCHAR *) = (WNDPROC (WINAPI *)(HWND, const TCHAR*))GetProcAddress(hinstDLL, LOAD_PROC);
-    if(Load) {
-        G_HotKeyProc = Load(g_hwnd, inipath);
+
+    HooksLoad = (hooks_load_proc_t)GetProcAddress(hinstDLL, LOAD_PROC);
+    HooksUnload = (hooks_unload_proc_t)GetProcAddress(hinstDLL, UNLOAD_PROC);
+    HooksKeyboardProc = (HOOKPROC)GetProcAddress(hinstDLL, LOW_LEVEL_KB_PROC);
+    if (!HooksLoad || !HooksUnload || !HooksKeyboardProc) {
+        FreeHooksDLL();
+        return FailHookSystem(TEXT("内置全局控制组件不完整或版本不匹配。"), ERROR_PROC_NOT_FOUND);
     }
 
+    G_HotKeyProc = HooksLoad(g_hwnd, inipath);
+    if (!G_HotKeyProc) {
+        DWORD error = GetLastError();
+        HooksUnload();
+        G_HotKeyProc = NULL;
+        return FailHookSystem(TEXT("内置全局控制组件初始化失败。"), error);
+    }
+    hooks_initialized = TRUE;
     LOG("HOOKS.DLL Loaded");
 
-    // Load keyboard hook
-    HOOKPROC procaddr;
+    keyhook = SetWindowsHookEx(WH_KEYBOARD_LL, HooksKeyboardProc, hinstDLL, 0);
     if (!keyhook) {
-        // Get address to keyboard hook (beware name mangling)
-        procaddr = (HOOKPROC) GetProcAddress(hinstDLL, LOW_LEVEL_KB_PROC);
-        if (procaddr == NULL) {
-            LOG("Could not find "LOW_LEVEL_KB_PROC" entry point in HOOKS.DLL");
-            return 1;
-        }
-        // Set up the keyboard hook
-        keyhook = SetWindowsHookEx(WH_KEYBOARD_LL, procaddr, hinstDLL, 0);
-        if (keyhook == NULL) {
-            LOG("Keyboard HOOK could not be set");
-            return 1;
-        }
+        DWORD error = GetLastError();
+        HooksUnload();
+        hooks_initialized = FALSE;
+        G_HotKeyProc = NULL;
+        LOG("Keyboard HOOK could not be set");
+        return FailHookSystem(TEXT("系统拒绝启动键盘全局控制。"), error);
     }
     LOG("Keyboard HOOK set");
 
@@ -100,29 +491,26 @@ static int HookSystem(void)
     SnapGap = CLAMP(-128, GetPrivateProfileInt(TEXT("Advanced"), TEXT("SnapGap"), 0, inipath), 127);
     ACMenuItems = GetPrivateProfileInt(TEXT("Advanced"), TEXT("ACMenuItems"), -1, inipath);
     UpdateTray();
-    return 0;
+    return TRUE;
 }
 /////////////////////////////////////////////////////////////////////////////
-static int showerror = 1;
 static int UnhookSystem(void)
 {
     LOG("Going to UnHook the system...");
-    if (!keyhook) { // System not hooked
+    if (!keyhook && !hooks_initialized) {
         return 1;
-    } else if (!UnhookWindowsHookEx(keyhook) && showerror) {
+    }
+    if (keyhook && !UnhookWindowsHookEx(keyhook) && showerror) {
         MessageBox(NULL, l10n->MiscUnhookError, TEXT(APP_NAMEA),
                    MB_ICONINFORMATION|MB_OK|MB_TOPMOST|MB_SETFOREGROUND);
     }
     keyhook = NULL;
 
-    // Tell dll file that we are unloading
-    void (WINAPI *Unload)() = (void (WINAPI *)()) GetProcAddress(hinstDLL, UNLOAD_PROC);
-    if (Unload) {
-        Unload();
-        // Zero out the message hwnd from DLL.
-        G_HotKeyProc = NULL;
+    if (hooks_initialized && HooksUnload) {
+        HooksUnload();
+        hooks_initialized = FALSE;
     }
-    //FreeHooksDLL();
+    G_HotKeyProc = NULL;
 
     // Success
     UpdateTray();
@@ -132,17 +520,17 @@ static int UnhookSystem(void)
 void ToggleState(void)
 {
     if (ENABLED()) {
+        hook_requested = FALSE;
         UnhookSystem();
     } else {
-        // SendMessage(g_hwnd, WM_UPDATESETTINGS, 0, 0);
+        hook_requested = TRUE;
         HookSystem();
     }
 }
 /////////////////////////////////////////////////////////////////////////////
 static void UpdateSettings(void)
 {
-    //PostMessage(g_hwnd, WM_UPDATESETTINGS, 0, 0);
-    if (ENABLED()) {
+    if (hook_requested) {
         UnhookSystem();
         HookSystem();
     }
@@ -298,11 +686,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     } else if (wParam && (msg == WM_PAINT || msg == WM_NCPAINT)) {
         return 0;
     } else if (msg == WM_TRAY) {
-        if (lParam == WM_LBUTTONDOWN || lParam == WM_LBUTTONDBLCLK) {
-            ToggleState();
-            if (lParam == WM_LBUTTONDBLCLK) {
-                SendMessage(hwnd, WM_OPENCONFIG, 0, 0);
-            }
+        if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+            SendMessage(hwnd, WM_COMMAND, CMD_WINDOWTOOL, 0);
         } else if (lParam == WM_MBUTTONDOWN) {
             SendMessage(hwnd, WM_COMMAND, CMD_OPENINIFILE, 0);
         } else if (lParam == WM_RBUTTONUP) {
@@ -315,6 +700,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     } else if (msg == WM_UPDATESETTINGS) {
         // Reload hooks
         UpdateSettings();
+    } else if (msg == WM_HOOKERROR) {
+        if (hook_requested) {
+            DWORD error = (DWORD)wParam;
+            UnhookSystem();
+            ShowHookError(TEXT("系统拒绝启动鼠标全局控制。"), error);
+        }
     } else if (msg == WM_ADDTRAY) {
         tray_hidden = 0;
         UpdateTray();
@@ -342,6 +733,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
            ElevateNow(0);
         } else if (wmId == CMD_CONFIG) {
             SendMessage(hwnd, WM_OPENCONFIG, 0, 0);
+        } else if (wmId == CMD_WINDOWTOOL) {
+            OpenWindowTool();
         } else if (wmId == CMD_ABOUT) {
             SendMessage(hwnd, WM_OPENCONFIG, 5, 0);
         } else if (wmId == CMD_OPENINIFILE) {
@@ -358,7 +751,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 UnhookSystem();
                 SaveCurrentLayout();
                 WriteCurrentLayoutNumber();
-                HookSystem();
+                if (hook_requested)
+                    HookSystem();
             }
         } else if (wmId == CMD_CLOSEZONES) {
             CloseAllTestWindows();
@@ -391,6 +785,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         showerror = 0;
         UnhookSystem();
     } else if (msg == WM_DESTROY) {
+        DestroyWindowTool();
         UnhookSystem();
         RemoveTray();
         PostQuitMessage(0);
@@ -419,37 +814,18 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int iCmdShow)
 {
     g_hinst = hInst;
+    SetThreadUILanguage(MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED));
 
-    // Get ini path
-    LOG("\n\nALTSNAP STARTED");
-    GetModuleFileName(NULL, inipath, ARR_SZ(inipath));
-    inipath[MAX_PATH-1] = '\0';
-    size_t inipath_len = lstrlen(inipath)-3;
-    lstrcpy_s(&inipath[inipath_len], 4, TEXT("ini"));
-    if (INVALID_FILE_ATTRIBUTES == GetFileAttributes(inipath)
-    && GetEnvironmentVariable(TEXT("APPDATA"), NULL, 0)) {
-        // .ini file is not in current directorry, and APPDATA exists
-        // we should look for %APPDATA%\AltSnap\AltSnap.ini
-        TCHAR userini[MAX_PATH];
-        GetEnvironmentVariable(TEXT("APPDATA"), userini, ARR_SZ(userini));
-        lstrcat_s(userini, ARR_SZ(userini), TEXT("\\AltSnap"));
-        if (INVALID_FILE_ATTRIBUTES == GetFileAttributes(userini)) {
-            CreateDirectory(userini, NULL);
-            LOG("CreateDirectory(%S)", userini);
-        }
-        // Full user ini name.
-        //lstrcat_s(userini, ARR_SZ(userini), TEXT("\\AltSnap.ini"));
-        const TCHAR *inifilename = inipath + inipath_len-3;
-        while (inifilename >= inipath && *inifilename != '\\') inifilename--;
-        lstrcat_s(userini, ARR_SZ(userini), inifilename);
-        if (INVALID_FILE_ATTRIBUTES == GetFileAttributes(userini)) {
-            // Copy AltSnap.dni (Default ini file) if no ini present
-            lstrcpy_s(&inipath[lstrlen(inipath)-3], 4, TEXT("dni"));
-            CopyFile(inipath, userini, FALSE); // AltSnap.dni -> AltSnap.ini
-            LOG("CopyFile(%S -> %S)", inipath, userini);
-        }
-
-        lstrcpy_s(inipath, ARR_SZ(inipath), userini);
+    // Select a writable portable or per-user configuration file.
+    LOG("\n\n" APP_NAMEA " STARTED");
+    if (!PrepareConfiguration()) {
+        DWORD error = GetLastError();
+        TCHAR message[512];
+        wsprintf(message,
+            TEXT("无法创建可写配置文件，程序不能安全启动。\n\n请检查当前目录和用户数据目录权限。\n错误代码：%lu"),
+            error ? error : ERROR_WRITE_FAULT);
+        MessageBox(NULL, message, APP_NAME, MB_OK | MB_ICONERROR);
+        return 0;
     }
     LOG("ini file: %S", inipath);
 
@@ -459,19 +835,19 @@ int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int
                || !!lstrstr(params, TEXT("-?"));
     if (help) {
         static const TCHAR *txthelp =
-            TEXT("AltSnap command line options:\n\n")
-            TEXT("--help\tShow this help!\n")
-            TEXT("-h\tHide the tray icon\n")
-            TEXT("-q\tQuiet mode\n")
-            TEXT("-m\tMultiple instances allowed\n")
-            TEXT("-c\tOpen Config dialog\n")
-            TEXT("-e\tElevate AltSnap\n")
-            TEXT("-r\tRelaod AltSnap settings\n")
-            TEXT("-lX\tSelect Snap Layout number X\n")
-            TEXT("-afX\tExecute action X for the foreground window\n")
-            TEXT("-apX\tExecute action X for the pointed window\n");
+            TEXT(APP_NAMEA " 命令行选项：\n\n")
+            TEXT("--help\t显示此帮助\n")
+            TEXT("-h\t隐藏通知区域图标\n")
+            TEXT("-q\t静默模式\n")
+            TEXT("-m\t允许多个实例\n")
+            TEXT("-c\t打开设置窗口\n")
+            TEXT("-e\t以管理员权限运行\n")
+            TEXT("-r\t重新加载设置\n")
+            TEXT("-lX\t选择编号为 X 的吸附布局\n")
+            TEXT("-afX\t对前台窗口执行动作 X\n")
+            TEXT("-apX\t对指针所在窗口执行动作 X\n");
 
-        MessageBox(NULL, txthelp, TEXT(APP_NAMEA)TEXT(" Usage"), MB_OK|MB_ICONINFORMATION);
+        MessageBox(NULL, txthelp, TEXT(APP_NAMEA)TEXT(" 使用方法"), MB_OK|MB_ICONINFORMATION);
         return 0;
     }
 
@@ -531,6 +907,7 @@ int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int
             if(tray_hidden) PostMessage(previnst, WM_CLOSECONFIG, 0, 0);
             if(config) PostMessage(previnst, WM_OPENCONFIG, 0, 0);
             if(rlini)  PostMessage(previnst, WM_UPDATESETTINGS, 0, 0);
+            if(!tray_hidden) PostMessage(previnst, WM_COMMAND, CMD_WINDOWTOOL, 0);
             PostMessage(previnst, tray_hidden? WM_HIDETRAY : WM_ADDTRAY, 0, 0);
             LOG("Updated old instance and NORMAL EXIT");
             return 0;
@@ -557,8 +934,12 @@ int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int
             LOG("No Elevation requested");
         }
     }
-    // Language
-    UpdateLanguage(); LOG("Language updated");
+    if (!UpdateLanguage()) {
+        MessageBox(NULL, TEXT("无法加载内置简体中文资源，程序将退出。"),
+            TEXT(APP_NAMEA), MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    LOG("Simplified Chinese language loaded");
 
     // Create window
     WNDCLASS wnd =
@@ -586,6 +967,9 @@ int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int
     // Hook system
     HookSystem();
 
+    if (!tray_hidden)
+        OpenWindowTool();
+
     // Add tray if hook failed, even though -hide was supplied
     if (tray_hidden && !keyhook) {
         tray_hidden = 0;
@@ -602,6 +986,8 @@ int WINAPI tWinMain(HINSTANCE hInst, HINSTANCE hPrevInstance, TCHAR *params, int
     while ((ret = GetMessage( &msg, NULL, 0, 0 )) != 0) {
         if (ret == -1) {
             break;
+        } else if (IsWindow(g_toolwnd) && IsDialogMessage(g_toolwnd, &msg)) {
+            continue;
         } else {
             TranslateMessage(&msg);
             DispatchMessage(&msg);

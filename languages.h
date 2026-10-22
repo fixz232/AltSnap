@@ -20,14 +20,6 @@
 // Resolve entry name from index.
 #define L10NSTR(i) ( ((const TCHAR*const*const)l10n)[i] )
 
-struct langinfoitem {
-  TCHAR code[8];
-  TCHAR *lang_english;
-  TCHAR *lang;
-  TCHAR *author;
-  TCHAR *fn;
-};
-
 #define LANGUAGE_MAP \
   LNGVALUE(Code,        TEXT("en-US"), NULL) \
   LNGVALUE(LangEnglish, TEXT("English"), NULL) \
@@ -69,7 +61,7 @@ struct langinfoitem {
   LNGVALUE(GeneralAutoSnap2,      TEXT("+ outside of windows"), NULL) \
   LNGVALUE(GeneralAutoSnap3,      TEXT("+ inside of windows"), NULL) \
   LNGVALUE(GeneralLanguage,       TEXT("&Language:"), NULL) \
-  LNGVALUE(GeneralFullWin,        TEXT("&Drag full windows"), NULL) \
+  LNGVALUE(GeneralFullWin,        TEXT("拖动完整窗口(&D)"), NULL) \
   LNGVALUE(GeneralUseZones,       TEXT("Snap to Layo&ut with Shift (configure with tray menu)"), TEXT("This option will mimick FancyZones\r\nOpen TestWindows to set up the zones\n Look at the tray icon menu")) \
   LNGVALUE(GeneralPiercingClick,  TEXT("Avoi&d blocking Alt+Click (disables AltSnap double-clicks)"), NULL) \
   LNGVALUE(GeneralResizeAll,      TEXT("&Resize all windows"), NULL) \
@@ -138,9 +130,9 @@ struct langinfoitem {
   LNGVALUE(InputActionStackList2,     TEXT("Laser stacked windows list"), NULL) \
   LNGVALUE(InputActionAltTabList,     TEXT("Windows list"), NULL) \
   LNGVALUE(InputActionAltTabFullList, TEXT("All windows list"), NULL) \
-  LNGVALUE(InputActionMZone,    TEXT("Move to zone"), NULL) \
-  LNGVALUE(InputActionXZone,    TEXT("Extend to the zone"), NULL) \
-  LNGVALUE(InputActionStep,     TEXT("Step"), NULL) \
+  LNGVALUE(InputActionMZone,    TEXT("移动到区域"), NULL) \
+  LNGVALUE(InputActionXZone,    TEXT("扩展到区域"), NULL) \
+  LNGVALUE(InputActionStep,     TEXT("步进"), NULL) \
   LNGVALUE(InputActionRoll,     TEXT("&Roll/Unroll window"), NULL) \
   LNGVALUE(InputActionAlwaysOnTop,  TEXT("Toggle always on &top"), NULL) \
   LNGVALUE(InputActionBorderless,   TEXT("Toggle &borderless"), NULL) \
@@ -162,9 +154,9 @@ struct langinfoitem {
   LNGVALUE(InputActionZoom,         TEXT("Zoom window"), NULL) \
   LNGVALUE(InputActionZoom2,        TEXT("Zoom window 2"), NULL) \
   LNGVALUE(InputActionHScroll,      TEXT("Horizontal scroll"), NULL) \
-  LNGVALUE(InputActionNPLayout,     TEXT("Next/Prev Snap Layout"), NULL) \
-  LNGVALUE(InputActionNLayout,     TEXT("Next Snap Layout"), NULL) \
-  LNGVALUE(InputActionPLayout,     TEXT("Prev Snap Layout"), NULL) \
+  LNGVALUE(InputActionNPLayout,     TEXT("下一个/上一个吸附布局"), NULL) \
+  LNGVALUE(InputActionNLayout,     TEXT("下一个吸附布局"), NULL) \
+  LNGVALUE(InputActionPLayout,     TEXT("上一个吸附布局"), NULL) \
   \
   LNGVALUE(InputHotkeysBox,            TEXT("Hotkeys"), NULL) \
   LNGVALUE(InputHotkeysModKey,         TEXT("Modifier key for al&ternate action:"), NULL) \
@@ -190,7 +182,7 @@ struct langinfoitem {
   LNGVALUE(InputHotkeysMore, TEXT("You can add any key by editing the ini file.\nUse the shift key to snap windows to each other."), NULL) \
   /* Blacklits Tab*/ \
   LNGVALUE(BlacklistBox,              TEXT("Blacklist settings"), NULL) \
-  LNGVALUE(BlacklistFormat,           TEXT("exename.exe\r\ntitle|class\r\n*|class\r\nexename.exe:title|class"), NULL) \
+  LNGVALUE(BlacklistFormat,           TEXT("程序名.exe\r\n标题|类名\r\n*|类名\r\n程序名.exe:标题|类名"), NULL) \
   LNGVALUE(BlacklistProcessBlacklist, TEXT("&Process blacklist:"), TEXT("Globally applies ie:\r\n*|Notepad, Photoshop.exe, explorer.exe*|#32770")) \
   LNGVALUE(BlacklistBlacklist,        TEXT("&Windows blacklist:"), NULL) \
   LNGVALUE(BlacklistScrolllist,       TEXT("Windows that should ignore &scroll action:"), NULL) \
@@ -232,14 +224,14 @@ struct langinfoitem {
   LNGVALUE(MiscZoneConfirmation, TEXT("Erase old snap layout and save current Test Windows positions as the new snap layout?"), NULL) \
   LNGVALUE(MiscZoneTestWinHelp,  TEXT("To setup Snap layout:\n1) Open several of those Test Windows\n2) Dispose them as you please\n3) Hit the *&Save test windows as snap layout* option in the tray menu"), NULL) \
   /* Basic Verbs */ \
-  LNGVALUE(WayLeft,       TEXT("Left"),       NULL) \
-  LNGVALUE(WayUp,         TEXT("Up"),         NULL) \
-  LNGVALUE(WayRight,      TEXT("Right"),      NULL) \
-  LNGVALUE(WayDown,       TEXT("Down"),       NULL) \
-  LNGVALUE(KwdSetTo,      TEXT("Set to"),     NULL) \
-  LNGVALUE(KwdToggle,     TEXT("Toggle"),     NULL) \
-  LNGVALUE(TtlAction,     TEXT("&Action"),     NULL) \
-  LNGVALUE(TtlAdvancedAction, TEXT("Advanced Action"),     NULL) \
+  LNGVALUE(WayLeft,       TEXT("左"),         NULL) \
+  LNGVALUE(WayUp,         TEXT("上"),         NULL) \
+  LNGVALUE(WayRight,      TEXT("右"),         NULL) \
+  LNGVALUE(WayDown,       TEXT("下"),         NULL) \
+  LNGVALUE(KwdSetTo,      TEXT("设为"),       NULL) \
+  LNGVALUE(KwdToggle,     TEXT("切换"),       NULL) \
+  LNGVALUE(TtlAction,     TEXT("动作(&A)"),   NULL) \
+  LNGVALUE(TtlAdvancedAction, TEXT("高级动作"), NULL) \
   \
   /* Extended character list  for each virtual key */ \
   LNGVALUE(a, TEXT("àáâäæãåª%āăąǎǟǡǣǻǽȁȃȧ|Ȧḁ%ⱥ|Ⱥɐ|Ɐɑ|Ɑɒ|Ɒⲁ|Ⲁⓐ"), NULL) \

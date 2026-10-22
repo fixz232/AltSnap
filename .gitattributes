@@ -1,2 +1,3 @@
-*.dni diff merge text linguist-language=ini working-tree-encoding=utf-16le-bom
-Lang/* diff merge text linguist-language=ini working-tree-encoding=utf-16le-bom
+# These files are already stored in their runtime encodings; preserve raw bytes.
+*.dni -text -diff -merge linguist-language=ini
+Lang/* -text -diff -merge linguist-language=ini

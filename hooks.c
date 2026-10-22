@@ -51,7 +51,7 @@ static UCHAR g_InFinishMovement;
 static UCHAR g_InMouseMove;
 
 static void UnhookMouse();
-static void HookMouse();
+static BOOL HookMouse();
 static void UnhookMouseOnly();
 static HWND KreateMsgWin(WNDPROC proc, const TCHAR *name, LONG_PTR userdata);
 
@@ -431,6 +431,7 @@ HWND g_mainhwnd = NULL;
 // Hook data
 HINSTANCE hinstDLL = NULL;
 HHOOK mousehook = NULL;
+static BOOL mousehookerrorreported = FALSE;
 
 #define FixDWMRect(hwnd, rect) FixDWMRectLL(hwnd, rect, conf.SnapGap)
 #undef GetWindowRectL
@@ -626,37 +627,24 @@ static void GetMinMaxInfo(HWND hwnd, POINT *Min, POINT *Max)
 // Set to -1 to clear old state
 static void SetWindowTrans(HWND hwnd)
 {
-    static BYTE oldtrans;
-    static HWND oldhwnd;
-    if (conf.MoveTrans == 0 || conf.MoveTrans == 255) return;
-    if (oldhwnd == hwnd) return; // Nothing to do
+    static window_alpha_state_t oldstate;
+    if (!oldstate.hwnd && (conf.MoveTrans == 0 || conf.MoveTrans == 255)) return;
+    if (oldstate.hwnd == hwnd) return; // Nothing to do
     if (hwnd == (HWND)(-1)) {
-        oldhwnd = NULL;
-        oldtrans = 0;
+        DiscardWindowAlphaState(&oldstate);
         return;
     }
 
-    if (hwnd && !oldtrans) {
-        oldhwnd = hwnd;
-        LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-        if (exstyle&WS_EX_LAYERED) {
-            BYTE ctrans=0;
-            if(GetLayeredWindowAttributes(hwnd, NULL, &ctrans, NULL))
-                if(ctrans) oldtrans = ctrans;
-        } else {
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle|WS_EX_LAYERED);
-            oldtrans = 255;
+    if (hwnd && !oldstate.hwnd) {
+        if (!CaptureWindowAlphaState(hwnd, &oldstate))
+            return;
+        if (!SetWindowAlpha(hwnd, conf.MoveTrans)) {
+            RestoreWindowAlphaState(&oldstate);
+            DiscardWindowAlphaState(&oldstate);
         }
-        SetLayeredWindowAttributes(hwnd, 0, conf.MoveTrans, LWA_ALPHA);
-    } else if (!hwnd && oldhwnd) { // restore old trans;
-        LONG_PTR exstyle = GetWindowLongPtr(oldhwnd, GWL_EXSTYLE);
-        if (!oldtrans || oldtrans == 255) {
-            SetWindowLongPtr(oldhwnd, GWL_EXSTYLE, exstyle & ~WS_EX_LAYERED);
-        } else {
-            SetLayeredWindowAttributes(oldhwnd, 0, oldtrans, LWA_ALPHA);
-        }
-        oldhwnd = NULL;
-        oldtrans = 0;
+    } else if (!hwnd && oldstate.hwnd) { // restore old transparency
+        RestoreWindowAlphaState(&oldstate);
+        DiscardWindowAlphaState(&oldstate);
     }
 }
 
@@ -2781,7 +2769,7 @@ __declspec(dllexport) LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wP
             #endif
 
             // Hook mouse
-            HookMouse();
+            (void)HookMouse();
             if (conf.GrabWithAlt[0].ac || conf.GrabWithAlt[1].ac) {
                 POINT pt;
                 action_t action = conf.GrabWithAlt[IsModKey(vkey) || (!IsHotkey(conf.ModKey[0])&&ModKey())];
@@ -3312,20 +3300,15 @@ static int ActionTransparency(HWND hwnd, short delta)
     if (blacklisted(hwnd, &BlkLst.Windows)) return 0; // Spetial
     if (state.action.ac && MOUVEMENT(state.action)) SetWindowTrans((HWND)-1);
 
-    static int alpha=255;
     short pre_delta = (state.shift)? conf.AlphaDeltaShift: conf.AlphaDelta;
     int alpha_delta = ScaleDeltaAndAccum(delta, pre_delta);
     if (!alpha_delta) return 1;
 
-    BYTE old_alpha;
-    if (GetLayeredWindowAttributes(hwnd, NULL, &old_alpha, NULL)) {
-         alpha = old_alpha; // If possible start from the current aplha.
-    }
-
-    alpha = CLAMP(conf.MinAlpha, alpha+alpha_delta, 255); // Limit alpha
-
-    SetWindowAlpha(hwnd, alpha);
-    return 1;
+    BYTE old_alpha = 255;
+    if (!GetWindowAlpha(hwnd, &old_alpha))
+        return 0;
+    int alpha = CLAMP(conf.MinAlpha, old_alpha+alpha_delta, 255); // Limit alpha
+    return SetWindowAlpha(hwnd, (BYTE)alpha);
 }
 
 static void ActionTransparency2(HWND hwnd, action_t action)
@@ -3334,9 +3317,11 @@ static void ActionTransparency2(HWND hwnd, action_t action)
     int alpha = 255;
     BYTE old_alpha = 255;
 
+    if (!GetWindowAlpha(hwnd, &old_alpha))
+        return;
     if (action.fl == ACFL_SET)
         alpha = action.wp;
-    else if (GetLayeredWindowAttributes(hwnd, NULL, &old_alpha, NULL))
+    else
         alpha = old_alpha;
 
     if (action.fl == ACFL_UP) // 2=>TOP/UP
@@ -5628,7 +5613,27 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 #undef CALLNEXTHOOK
 
 /////////////////////////////////////////////////////////////////////////////
-static void HookMouse(void)
+static BOOL InstallMouseHook(void)
+{
+    #ifdef NO_HOOK_LL
+    mousehook = (void*)SetTimer(g_mainhwnd, POOL_TIMER, 32, (TIMERPROC)TimerWindowProc);
+    #else
+    mousehook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hinstDLL, 0);
+    #endif
+
+    if (mousehook) {
+        mousehookerrorreported = FALSE;
+        return TRUE;
+    }
+
+    DWORD errorCode = GetLastError();
+    if (!mousehookerrorreported) {
+        mousehookerrorreported = TRUE;
+        PostMessage(g_mainhwnd, WM_HOOKERROR, errorCode, 0);
+    }
+    return FALSE;
+}
+static BOOL HookMouse(void)
 {
     state.moving = 0; // Used to know the first time we call MouseMove.
     #ifndef NO_HOOK_LL
@@ -5639,14 +5644,10 @@ static void HookMouse(void)
 
     // Check if mouse is already hooked
     if (mousehook)
-        return ;
+        return TRUE;
 
     // Set up the mouse hook
-    #ifdef NO_HOOK_LL
-    mousehook = (void*)SetTimer(g_mainhwnd, POOL_TIMER, 32, (TIMERPROC)TimerWindowProc);
-    #else
-    mousehook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hinstDLL, 0);
-    #endif
+    return InstallMouseHook();
 }
 /////////////////////////////////////////////////////////////////////////////
 static void UnhookMouseOnly(void)
@@ -5703,9 +5704,12 @@ static VOID CALLBACK TimerWindowProc(HWND hwnd, UINT msg, UINT_PTR idEvent, DWOR
         // This can often happen if locking or sleeping the computer a lot
         POINT pt;
         GetCursorPos(&pt); // I donot know if we should really use the ASYN version.
-        if (mousehook && !SamePt(state.prevpt, pt)) {
-            UnhookWindowsHookEx(mousehook);
-            mousehook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hinstDLL, 0);
+        if (!mousehook || !SamePt(state.prevpt, pt)) {
+            if (mousehook) {
+                UnhookWindowsHookEx(mousehook);
+                mousehook = NULL;
+            }
+            InstallMouseHook();
         }
         } break;
     #endif
@@ -6607,6 +6611,7 @@ __declspec(dllexport) WNDPROC WINAPI Load(HWND mainhwnd, const TCHAR *inipath)
     // Reset stuff...
     mem00(&state, sizeof(state));
     mem00(&LastWin, sizeof(LastWin));
+    mousehookerrorreported = FALSE;
 
     // GET SYSTEM SETTINGS
     // I am unable to get consistent SPI_GETMOUSEDRAGOUTTHRESHOLD results
@@ -6767,7 +6772,7 @@ __declspec(dllexport) WNDPROC WINAPI Load(HWND mainhwnd, const TCHAR *inipath)
 
     // Hook mouse if a permanent hook is needed
     if (conf.keepMousehook) {
-        HookMouse();
+        (void)HookMouse();
         SetTimer(g_mainhwnd, REHOOK_TIMER, 5000, (TIMERPROC)TimerWindowProc); // Start rehook timer
     }
 

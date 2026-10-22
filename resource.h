@@ -5,13 +5,17 @@
 #define IDC_STATIC (-1)
 #endif
 
-#define VERSIONRC     1,6,8,0
-#define APP_VERSION  "1.68"
+#define VERSIONRC     1,6,8,2
+#define APP_VERSION  "1.68-sc2"
 
 #define APP_ICON                         101
 #define TRAY_OFF                         102
 #define TRAY_ON                          103
 #define TRAY_SUS                         104
+#define IDR_ZH_CN                        105
+#define IDR_HOOKS_DLL                    106
+#define IDR_DEFAULT_INI                  107
+#define IDR_HOOKS_HASH                   108
 
 #define IDD_GENERALPAGE                  201
 #define IDD_MOUSEPAGE                    202
@@ -20,6 +24,7 @@
 #define IDD_ADVANCEDPAGE                 205
 #define IDD_ABOUTPAGE                    206
 #define IDD_ACTIONPARAM                  207
+#define IDD_WINDOWTOOL                   208
 
 #define IDI_FIND                         301
 #define IDI_BIGICON                      302
@@ -28,7 +33,6 @@
 #define IDC_AUTOSNAP_HEADER             1000
 #define IDC_FINDWINDOW                  1000
 #define IDC_CHECKNOW                    1001
-#define IDC_LANGUAGE_HEADER             1001
 #define IDC_TTBACTIONSNA                1001
 #define IDC_TRANSLATIONS_BOX            1001
 #define IDC_INI                         1002
@@ -61,7 +65,6 @@
 #define IDC_AUTOSNAP                    1102
 #define IDC_AERO                        1103
 #define IDC_INACTIVESCROLL              1104
-#define IDC_LANGUAGE                    1105
 #define IDC_LMB                         1201
 #define IDC_MMB                         1202
 #define IDC_RMB                         1203
@@ -210,5 +213,31 @@
 #define IDC_SHORTCUTS_CLEAR             2105
 #define IDC_USEPTWINDOW                 2106
 #define IDC_SIDESFRACTION               2107
+
+#define IDC_WT_SELECTED                 2200
+#define IDC_WT_LIST                     2201
+#define IDC_WT_PICKER                   2202
+#define IDC_WT_REFRESH                  2203
+#define IDC_WT_ACTIVATE                 2204
+#define IDC_WT_SETTINGS                 2205
+#define IDC_WT_OPACITY_LABEL            2206
+#define IDC_WT_OPACITY                  2207
+#define IDC_WT_PERCENT                  2208
+#define IDC_WT_RESET                    2209
+#define IDC_WT_TOPMOST                  2210
+#define IDC_WT_STATUS                   2211
+#define IDC_WT_EXIT                     2212
+#define IDC_WT_FORCE                    2213
+#define IDC_WT_CAPTURE_PROTECTION       2214
+#define IDC_WT_SECURE_MIRROR             2215
+
+#define IDC_WT_NAV_GENERAL              2300
+#define IDC_WT_NAV_MOUSE                2301
+#define IDC_WT_NAV_KEYBOARD             2302
+#define IDC_WT_NAV_BLACKLIST            2303
+#define IDC_WT_NAV_ADVANCED             2304
+#define IDC_WT_NAV_ABOUT                2305
+#define IDC_WT_APPLY                    2306
+#define IDC_WT_DONE                     2307
 
 #endif // AS_RESOURCE_H

@@ -1,4 +1,5 @@
 #include "resource.h"
+LANGUAGE 4, 2
 
 1 VERSIONINFO
   FILEVERSION VERSIONRC
@@ -11,18 +12,20 @@
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
-    BLOCK "040904b0"
+    BLOCK "080404b0"
     BEGIN
-      VALUE "FileDescription", "Hooks for AltSnap"
+      VALUE "FileDescription", "圣子猫透明窗体全局钩子"
       VALUE "InternalName", "hooks"
       VALUE "OriginalFilename", "hooks.dll"
       VALUE "FileVersion", APP_VERSION
-      VALUE "CompanyName", "Gillibert Software"
-      VALUE "LegalCopyright", "Gillibert"
+      VALUE "ProductName", "圣子猫透明窗体"
+      VALUE "ProductVersion", APP_VERSION
+      VALUE "CompanyName", "圣子猫 / AltSnap 贡献者"
+      VALUE "LegalCopyright", "AltSnap 贡献者；2026 年修改"
     END
   END
   BLOCK "VarFileInfo"
   BEGIN
-    VALUE "Translation", 0x409, 1200
+    VALUE "Translation", 0x804, 1200
   END
 END

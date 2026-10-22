@@ -33,11 +33,20 @@ static const TCHAR *tray_iconstr[] = {
     TEXT("TRAY_SUS")
 };
 static const TCHAR *tray_tooltipstr[] = {
-    TEXT(APP_NAMEA)TEXT(" (Off)"),
-    TEXT(APP_NAMEA)TEXT(" (On)"),
-    TEXT(APP_NAMEA)TEXT("..."),
+    TEXT(APP_NAMEA)TEXT("（已停用）"),
+    TEXT(APP_NAMEA)TEXT("（已启用）"),
+    TEXT(APP_NAMEA)TEXT("（已挂起）"),
 };
 static HICON g_icons[ICONS_COUNT];
+
+/* Load the tray icon at the notification area size so the shell uses the frame
+ * drawn for that size instead of scaling the large one down. */
+static HICON LoadTrayIcon(int index)
+{
+    HICON icon = (HICON)LoadImage(g_hinst, MAKEINTRESOURCE(TRAY_OFF+index), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    return icon? icon: LoadIcon(g_hinst, MAKEINTRESOURCE(TRAY_OFF+index));
+}
 
 static void LoadAllIcons(void)
 {
@@ -59,7 +68,7 @@ static void LoadAllIcons(void)
                     lstrcpy_s(p, ARR_SZ(path)-len, tray_iconstr[i]);
                     lstrcat_s(path, ARR_SZ(path), TEXT(".ico"));
                     HICON tmp = (HICON)LoadImage(g_hinst, path, IMAGE_ICON,0,0, LR_LOADFROMFILE|LR_DEFAULTSIZE|LR_LOADTRANSPARENT);
-                    g_icons[i] = tmp? tmp: LoadIcon(g_hinst, MAKEINTRESOURCE( TRAY_OFF+i ));
+                    g_icons[i] = tmp? tmp: LoadTrayIcon(i);
                 }
                 return;
             }
@@ -67,7 +76,7 @@ static void LoadAllIcons(void)
     }
     // Fallback to internal icons.
     for (size_t i = 0; i < ICONS_COUNT; i++)
-        g_icons[i] = LoadIcon(g_hinst, MAKEINTRESOURCE( TRAY_OFF+i ));
+        g_icons[i] = LoadTrayIcon((int)i);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -271,6 +280,7 @@ static void ShowContextMenu(HWND hwnd)
                  , CMD_ELEVATE, (elevated? l10n->GeneralElevated: l10n->GeneralElevate));
 
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(menu, MF_STRING, CMD_WINDOWTOOL, TEXT("打开透明度面板"));
     AppendMenu(menu, MF_STRING, CMD_CONFIG, l10n->MenuConfigure);
     AppendMenu(menu, MF_STRING, CMD_ABOUT, l10n->MenuAbout);
     AppendMenu(menu, MF_STRING, CMD_OPENINIFILE, l10n->MenuOpenIniFile);

@@ -87,7 +87,11 @@ static void mem00(void *dst, size_t count)
         *a++ = 0;
 }
 
-#ifdef CLANG
+#if defined(CLANG) || defined(NANOLIBC_NO_CRT)
+
+#ifdef _MSC_VER
+#pragma function(memset, memcpy, strlen)
+#endif
 
 void * __cdecl memset(void *dst, int s, size_t count)
 {
@@ -98,7 +102,7 @@ void * __cdecl memset(void *dst, int s, size_t count)
     return dst;
 }
 /* in case */
-__cdecl size_t strlen(const char *str)
+size_t __cdecl strlen(const char *str)
 {
     const char *ptr;
     for (ptr=str; *ptr != '\0'; ptr++);

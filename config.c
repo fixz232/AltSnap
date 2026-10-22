@@ -27,6 +27,13 @@ static LRESULT CALLBACK FindWindowProc(HWND, UINT, WPARAM, LPARAM);
 
 HWND g_cfgwnd = NULL;
 
+// Page currently shown by the in-window settings view (defined in windowtool.c,
+// which is part of the same translation unit).  The preference pages no longer
+// live in a property sheet, so they find their host page through this handle.
+static HWND g_wt_inline_page = NULL;
+static void OpenWindowToolSettings(int page);
+static void CloseWindowToolSettings(void);
+
 
 /////////////////////////////////////////////////////////////////////////////
 // No error reporting since we don't want the user to be interrupted
@@ -62,14 +69,18 @@ static void CheckAutostart(int *_on, int *_hidden, int *_elevated)
 }
 
 /////////////////////////////////////////////////////////////////////////////
-static void SetAutostart(int on, int hhide, int eelevate)
+static BOOL SetAutostart(int on, int hhide, int eelevate)
 {
     // Open key
     HKEY key;
     int error = RegCreateKeyEx(HKEY_CURRENT_USER
                               , TEXT("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
                               , 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
-    if (error != ERROR_SUCCESS) return;
+    if (error != ERROR_SUCCESS) {
+        SetLastError(error);
+        return FALSE;
+    }
+    LONG write_error;
     if (on) {
         // Get path
         TCHAR value[MAX_PATH+20];
@@ -81,13 +92,21 @@ static void SetAutostart(int on, int hhide, int eelevate)
         if (hhide)    lstrcat_s(value, ARR_SZ(value), TEXT(" -hide"));
         if (eelevate) lstrcat_s(value, ARR_SZ(value), TEXT(" -elevate"));
         // Set autostart
-        RegSetValueEx(key, TEXT(APP_NAMEA), 0, REG_SZ, (LPBYTE)value, (lstrlen(value)+1)*sizeof(value[0]));
+        write_error = RegSetValueEx(key, TEXT(APP_NAMEA), 0, REG_SZ,
+            (LPBYTE)value, (lstrlen(value)+1)*sizeof(value[0]));
     } else {
         // Remove
-        RegDeleteValue(key, TEXT(APP_NAMEA));
+        write_error = RegDeleteValue(key, TEXT(APP_NAMEA));
+        if (write_error == ERROR_FILE_NOT_FOUND)
+            write_error = ERROR_SUCCESS;
     }
     // Close key
     RegCloseKey(key);
+    if (write_error != ERROR_SUCCESS) {
+        SetLastError(write_error);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -110,59 +129,16 @@ static BOOL ElevateNow(int showconfig)
         return FALSE;
 }
 /////////////////////////////////////////////////////////////////////////////
-// Entry point
+// Entry point.  Settings open inside the transparency panel instead of a
+// separate property sheet window.
 static void OpenConfig(int startpage)
 {
-    ListAllTranslations(); // In case
-    if (IsWindow(g_cfgwnd)) {
-        PropSheet_SetCurSel(g_cfgwnd, 0, startpage);
-        SetForegroundWindow(g_cfgwnd);
-        return;
-    }
-    // Define the pages
-    static const struct {
-        WORD pszTemplate;
-        DLGPROC pfnDlgProc;
-    } pages[] = {
-        { IDD_GENERALPAGE,   (DLGPROC)GeneralPageDialogProc  },
-        { IDD_MOUSEPAGE,     (DLGPROC)MousePageDialogProc    },
-        { IDD_KBPAGE,        (DLGPROC)KeyboardPageDialogProc },
-        { IDD_BLACKLISTPAGE, (DLGPROC)BlacklistPageDialogProc},
-        { IDD_ADVANCEDPAGE,  (DLGPROC)AdvancedPageDialogProc },
-        { IDD_ABOUTPAGE,     (DLGPROC)AboutPageDialogProc    }
-    };
-    PROPSHEETPAGE psp[ARR_SZ(pages)];
-    mem00(&psp[0], sizeof(psp));
-    for (size_t i = 0; i < ARR_SZ(pages); i++) {
-        psp[i].dwSize = sizeof(*psp);
-        psp[i].hInstance = g_hinst;
-        psp[i].pszTemplate = MAKEINTRESOURCE(pages[i].pszTemplate);
-        psp[i].pfnDlgProc = pages[i].pfnDlgProc;
-    }
-
-    // Define the property sheet
-    PROPSHEETHEADER psh;
-    mem00(&psh, sizeof(psh));
-    psh.dwSize = sizeof(psh);
-    psh.dwFlags = WinVer >= VISTA ? PSH_PROPSHEETPAGE|PSH_USECALLBACK|PSH_USEHICON|PSH_NOCONTEXTHELP
-                       : PSH_PROPSHEETPAGE|PSH_USECALLBACK|PSH_USEHICON;
-    psh.hwndParent = NULL;
-    psh.hInstance = g_hinst;
-    psh.hIcon = g_icons[1]; //LoadIcon(g_hinst, iconstr[1]);
-    psh.pszCaption = TEXT(APP_NAMEA);
-    psh.nPages = ARR_SZ(psp);
-    psh.ppsp = psp;
-    psh.pfnCallback = PropSheetProc;
-    psh.nStartPage = startpage;
-
-    // Open the property sheet
-    InitCommonControls();
-    PropertySheet(&psh);
+    OpenWindowToolSettings(startpage);
 }
 /////////////////////////////////////////////////////////////////////////////
 static void CloseConfig(void)
 {
-    PostMessage(g_cfgwnd, WM_CLOSE, 0, 0);
+    CloseWindowToolSettings();
 }
 
 static void MoveButtonUporDown(WORD id, WINDOWPLACEMENT *wndpl, int diffrows)
@@ -227,6 +203,8 @@ static void UpdateStrings(void)
 }
 static void MoveToCorner(HWND hwnd)
 {
+    if (!IsWindow(hwnd))
+        return;
     hwnd = GetAncestor(hwnd, GA_ROOT);
     static HWND ohwnd;
     if(hwnd == ohwnd) return;
@@ -261,7 +239,11 @@ static BOOL CALLBACK PropSheetProc(HWND hwnd, UINT msg, LPARAM lParam)
 {
     if (msg == PSCB_INITIALIZED) {
         g_cfgwnd = hwnd;
+        WTApplyCaptureProtection(hwnd);
         UpdateStrings();
+        SetDlgItemText(hwnd, IDOK, TEXT("确定"));
+        SetDlgItemText(hwnd, IDCANCEL, TEXT("取消"));
+        SetDlgItemText(hwnd, IDAPPLY, TEXT("应用"));
 
         // Set new icon specifically for the taskbar and Alt+Tab, without changing window icon
         //HICON taskbar_icon = (HICON)LoadImageA(g_hinst, MAKEINTRESOURCEA(APP_ICON), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR);
@@ -532,7 +514,6 @@ static INT_PTR CALLBACK GeneralPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam
         { IDC_INACTIVESCROLL,   L10NIDX(GeneralInactiveScroll) },
         { IDC_MDI,              L10NIDX(GeneralMDI) },
         { IDC_AUTOSNAP_HEADER,  L10NIDX(GeneralAutoSnap) },
-        { IDC_LANGUAGE_HEADER,  L10NIDX(GeneralLanguage) },
         { IDC_USEZONES,         L10NIDX(GeneralUseZones) },
         { IDC_PIERCINGCLICK,    L10NIDX(GeneralPiercingClick) },
         { IDC_RESIZEALL,        L10NIDX(GeneralResizeAll) },
@@ -558,18 +539,6 @@ static INT_PTR CALLBACK GeneralPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam
         ret = ret==1? IDC_RZCENTER_NORM: ret==2? IDC_RZCENTER_MOVE: ret==3? IDC_RZCENTER_CLOSE: IDC_RZCENTER_BR;
         CheckRadioButton(hwnd, IDC_RZCENTER_NORM, IDC_RZCENTER_CLOSE, ret);
 
-        HWND control = GetDlgItem(hwnd, IDC_LANGUAGE);
-        CB_ResetContent(control);
-        EnableWindow(control, TRUE);
-
-        if (langinfo.it) {
-            for (size_t i = 0; i < langinfo.num; i++) {
-                CB_AddString(control, langinfo.it[i].lang);
-                if ( !lstrcmpi(l10n->Code, langinfo.it[i].code) ) {
-                    CB_SetCurSel(control, i);
-                }
-            }
-        }
         EnableDlgItem(hwnd, IDC_ELEVATE, WinVer >= VISTA && !elevated);
 //    } else if (msg == WM_HELP) {
 //        ShowContextHelp(strlst, ARR_SZ(strlst), hwnd, (LPHELPINFO)lParam);
@@ -616,6 +585,7 @@ static INT_PTR CALLBACK GeneralPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam
             EnableDlgItem(hwnd, IDC_AUTOSTART_ELEVATE, autostart && WinVer >= VISTA);
             if(WinVer >= WIN10) EnableDlgItem(hwnd, IDC_INACTIVESCROLL, IsChecked(IDC_INACTIVESCROLL));
         } else if (pnmh->code == PSN_APPLY && have_to_apply) {
+            BeginConfigWrite();
             // all bool options (checkboxes).
             WriteDialogOptions(hwnd, optlst, ARR_SZ(optlst));
 
@@ -626,27 +596,15 @@ static INT_PTR CALLBACK GeneralPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam
             val = IsChecked(IDC_RZCENTER_NORM)? 1: IsChecked(IDC_RZCENTER_MOVE)? 2:IsChecked(IDC_RZCENTER_CLOSE)? 3: 0;
             WritePrivateProfileString(TEXT("General"),    TEXT("ResizeCenter"), Uint2lStr(txt, val), inipath);
 
-            // Load selected Language
-            int i = CB_GetCurSelId(IDC_LANGUAGE);
-            if (langinfo.it && (size_t)i < langinfo.num && lstrcmpi(l10n->Code, langinfo.it[i].code)) {
-                LoadTranslation(langinfo.it[i].fn);
-                #ifdef UNICODE
-                wchar_t curlang[16];
-                GetCUserLanguage_xx_XX(curlang);
-                if (!lstrcmpi(l10n->Code, curlang)) // Use Auto if selected language is the current user's one.
-                    WritePrivateProfileString(TEXT("General"), TEXT("Language"), TEXT("Auto"), inipath);
-                else
-                    WritePrivateProfileString(TEXT("General"), TEXT("Language"), l10n->Code, inipath);
-                #else
-                WritePrivateProfileString(TEXT("General"), TEXT("Language"), l10n->Code, inipath);
-                #endif
-                updatestrings = 1;
-                UpdateStrings();
-            }
-
             // Autostart
-            SetAutostart(IsChecked(IDC_AUTOSTART), IsChecked(IDC_AUTOSTART_HIDE), IsChecked(IDC_AUTOSTART_ELEVATE));
+            if (!SetAutostart(IsChecked(IDC_AUTOSTART), IsChecked(IDC_AUTOSTART_HIDE),
+                              IsChecked(IDC_AUTOSTART_ELEVATE)))
+                RecordConfigWriteError(GetLastError());
 
+            if (!FinishConfigWrite(hwnd)) {
+                SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
             UpdateSettings();
             // Update Test windows in if open.
             EnumThreadWindows(GetCurrentThreadId(), RefreshTestWin, 0);
@@ -672,9 +630,6 @@ static INT_PTR CALLBACK GeneralPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam
         GetPrivateProfileString(TEXT("General"), TEXT("AutoSnap"), TEXT("0"), txt, ARR_SZ(txt), inipath);
         CB_SetCurSel(control, strtoi(txt));
 
-        // Language
-        control = GetDlgItem(hwnd, IDC_LANGUAGE);
-        CB_DeleteString(control, langinfo.num);
     }
     return FALSE;
 }
@@ -804,9 +759,31 @@ static void FillActionDropListS(HWND hwnd, int idc, TCHAR *inioption, const acti
     CB_SetCurSel(control, sel);
 }
 
+static void FillActionDropListValue(HWND hwnd, int idc, const TCHAR *value, const actiondl_t *actions)
+{
+    HWND control = GetDlgItem(hwnd, idc);
+    int sel=-1, j;
+    CB_ResetContent(control);
+    for (j = 0; actions[j].action; j++) {
+        TCHAR action_name[256];
+        lstrcpy_noaccel(action_name, ARR_SZ(action_name), L10NSTR(actions[j].l10nidx));
+        CB_AddString(control, action_name);
+        if (!lstrcmpi(value, actions[j].action)) {
+            sel = j;
+        }
+    }
+    if (sel < 0) {
+        // Preserve custom actions that are not in the built-in list.
+        CB_AddString(control, value);
+        sel = j;
+    }
+    CB_SetCurSel(control, sel);
+}
+
 static int GetActionStringFromDropList(HWND hwnd, int idc, const actiondl_t *actions, TCHAR *obuf, size_t obuflen)
 {
     HWND control = GetDlgItem(hwnd, idc);
+    if (obuflen) obuf[0] = TEXT('\0');
     int j = SendMessage(control, CB_GETCURSEL, 0, 0);
     if (j >= 0 && actions[j].action) { // Inside of known values
         lstrcpy_s(obuf, obuflen, actions[j].action); // DONE!
@@ -835,6 +812,8 @@ static void WriteActionDropListS(HWND hwnd, int idc, TCHAR *inioption, const act
 static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     static int have_to_apply = 0;
+    static int actions_filled = 0;
+    static int current_optoff = 0;
     // Mouse actions
     static const struct {
         int control; // Same control
@@ -844,7 +823,7 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
         { IDC_MMB,     {TEXT("MMB"), TEXT("MMBB"), TEXT("MMBT"), TEXT("MMBM"), TEXT("MMBR")} },
         { IDC_RMB,     {TEXT("RMB"), TEXT("RMBB"), TEXT("RMBT"), TEXT("RMBM"), TEXT("RMBR")} },
         { IDC_MB4,     {TEXT("MB4"), TEXT("MB4B"), TEXT("MB4T"), TEXT("MB4M"), TEXT("MB4R")} },
-        { IDC_MB5,     {TEXT("MB5"), TEXT("MB5B"), TEXT("MB5T"), TEXT("MB5M"), TEXT("MB5M")} },
+        { IDC_MB5,     {TEXT("MB5"), TEXT("MB5B"), TEXT("MB5T"), TEXT("MB5M"), TEXT("MB5R")} },
     };
     static const struct {
         int control; // Same control
@@ -940,6 +919,11 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
         {NULL, 0}
     };
 
+    enum { ACTION_MODE_COUNT = 5, ACTION_TOKEN_LEN = 128 };
+    static TCHAR mouse_button_values[ACTION_MODE_COUNT][ARR_SZ(mouse_buttons)][ACTION_TOKEN_LEN];
+    static TCHAR mouse_button_up_values[ACTION_MODE_COUNT][ARR_SZ(mouse_buttonsUP)][ACTION_TOKEN_LEN];
+    static TCHAR mouse_wheel_values[ACTION_MODE_COUNT][ARR_SZ(mouse_wheels)][ACTION_TOKEN_LEN];
+
     // Hotkeys
     static const struct hk_struct hotclicks [] = {
         { IDC_MMB_HC, 0x04 },
@@ -958,6 +942,24 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
 
 
     if (msg == WM_INITDIALOG) {
+        unsigned i, mode;
+        have_to_apply = 0;
+        actions_filled = 0;
+        current_optoff = 0;
+        for (mode = 0; mode < ACTION_MODE_COUNT; mode++) {
+            for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
+                GetPrivateProfileString(TEXT("Input"), mouse_buttons[i].option[mode], TEXT("Nothing"),
+                                        mouse_button_values[mode][i], ARR_SZ(mouse_button_values[mode][i]), inipath);
+            }
+            for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
+                GetPrivateProfileString(TEXT("Input"), mouse_buttonsUP[i].option[mode], TEXT("Nothing"),
+                                        mouse_button_up_values[mode][i], ARR_SZ(mouse_button_up_values[mode][i]), inipath);
+            }
+            for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
+                GetPrivateProfileString(TEXT("Input"), mouse_wheels[i].option[mode], TEXT("Nothing"),
+                                        mouse_wheel_values[mode][i], ARR_SZ(mouse_wheel_values[mode][i]), inipath);
+            }
+        }
         // Hotclicks buttons
         ReadDialogOptions(hwnd, optlst, ARR_SZ(optlst));
         CheckRadioButton(hwnd, IDC_MBA1, IDC_WHILER, IDC_MBA1); // Check the primary action
@@ -966,6 +968,25 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
         int event = HIWORD(wParam);
         int id = LOWORD(wParam);
         if (id >= IDC_MBA1 && id <= IDC_WHILER) {
+            unsigned i;
+            if (actions_filled) {
+                for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
+                    GetActionStringFromDropList(hwnd, mouse_buttons[i].control,
+                                                current_optoff<3? mouse_actions: mouse_actionsWMR,
+                                                mouse_button_values[current_optoff][i], ACTION_TOKEN_LEN);
+                }
+                if (current_optoff < 3) {
+                    for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
+                        GetActionStringFromDropList(hwnd, mouse_buttonsUP[i].control, mouse_actionsUP,
+                                                    mouse_button_up_values[current_optoff][i], ACTION_TOKEN_LEN);
+                    }
+                }
+                for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
+                    GetActionStringFromDropList(hwnd, mouse_wheels[i].control, scroll_actions,
+                                                mouse_wheel_values[current_optoff][i], ACTION_TOKEN_LEN);
+                }
+            }
+            current_optoff = id - IDC_MBA1;
             //CheckRadioButton(hwnd, IDC_MBA1, IDC_WHILER, id); // Check the selected action
             goto FILLACTIONS;
         }
@@ -989,23 +1010,26 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
                        : IsChecked(IDC_INTTB)? 2
                        : IsChecked(IDC_WHILEM)? 3
                        : IsChecked(IDC_WHILER)? 4: 0;
+            current_optoff = optoff;
 
             // We must disable MoveUp and ResizeUp for the
             // While Moving/While resizing opts.
             EnableDlgItem(hwnd, IDC_MOVEUP,   optoff < 3);
             EnableDlgItem(hwnd, IDC_RESIZEUP, optoff < 3);
             for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
-                FillActionDropListS(hwnd, mouse_buttons[i].control, mouse_buttons[i].option[optoff], optoff<3?mouse_actions:mouse_actionsWMR);
+                FillActionDropListValue(hwnd, mouse_buttons[i].control, mouse_button_values[optoff][i],
+                                        optoff<3? mouse_actions: mouse_actionsWMR);
             }
             if (optoff < 3) {
                 for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
-                    FillActionDropListS(hwnd, mouse_buttonsUP[i].control, mouse_buttonsUP[i].option[optoff], mouse_actionsUP);
+                    FillActionDropListValue(hwnd, mouse_buttonsUP[i].control, mouse_button_up_values[optoff][i], mouse_actionsUP);
                 }
             }
             // Scroll actions, always the same.
             for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
-                FillActionDropListS(hwnd, mouse_wheels[i].control, mouse_wheels[i].option[optoff], scroll_actions);
+                FillActionDropListValue(hwnd, mouse_wheels[i].control, mouse_wheel_values[optoff][i], scroll_actions);
             }
+            actions_filled = 1;
 
             // Update text
             static const dialogstring_t strlst[] = {
@@ -1039,33 +1063,67 @@ static INT_PTR CALLBACK MousePageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
             UpdateDialogStrings(hwnd, strlst, ARR_SZ(strlst));
             }
 
-        } else if (pnmh->code == PSN_APPLY && have_to_apply) {
-            // Mouse actions, for all mouse buttons...
+        } else if (pnmh->code == PSN_KILLACTIVE && actions_filled) {
             unsigned i;
-            // Add 2 if in titlear add one for secondary action.
-            // Mouse actions
-            int optoff = IsChecked(IDC_MBA2)? 1
-                       : IsChecked(IDC_INTTB)? 2
-                       : IsChecked(IDC_WHILEM)? 3
-                       : IsChecked(IDC_WHILER)? 4: 0;
             for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
-                WriteActionDropListS(hwnd, mouse_buttons[i].control , mouse_buttons[i].option[optoff]
-                                   , optoff<3? mouse_actions: mouse_actionsWMR);
+                GetActionStringFromDropList(hwnd, mouse_buttons[i].control,
+                                            current_optoff<3? mouse_actions: mouse_actionsWMR,
+                                            mouse_button_values[current_optoff][i], ACTION_TOKEN_LEN);
             }
-            if (optoff < 3) {
+            if (current_optoff < 3) {
                 for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
-                    WriteActionDropListS(hwnd, mouse_buttonsUP[i].control, mouse_buttonsUP[i].option[optoff], mouse_actionsUP);
+                    GetActionStringFromDropList(hwnd, mouse_buttonsUP[i].control, mouse_actionsUP,
+                                                mouse_button_up_values[current_optoff][i], ACTION_TOKEN_LEN);
                 }
             }
-            // Scroll
             for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
-                WriteActionDropListS(hwnd, mouse_wheels[i].control, mouse_wheels[i].option[optoff], scroll_actions);
+                GetActionStringFromDropList(hwnd, mouse_wheels[i].control, scroll_actions,
+                                            mouse_wheel_values[current_optoff][i], ACTION_TOKEN_LEN);
+            }
+        } else if (pnmh->code == PSN_APPLY && have_to_apply) {
+            BeginConfigWrite();
+            // Mouse actions, for all mouse buttons...
+            unsigned i, mode;
+            for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
+                GetActionStringFromDropList(hwnd, mouse_buttons[i].control,
+                                            current_optoff<3? mouse_actions: mouse_actionsWMR,
+                                            mouse_button_values[current_optoff][i], ACTION_TOKEN_LEN);
+            }
+            if (current_optoff < 3) {
+                for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
+                    GetActionStringFromDropList(hwnd, mouse_buttonsUP[i].control, mouse_actionsUP,
+                                                mouse_button_up_values[current_optoff][i], ACTION_TOKEN_LEN);
+                }
+            }
+            for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
+                GetActionStringFromDropList(hwnd, mouse_wheels[i].control, scroll_actions,
+                                            mouse_wheel_values[current_optoff][i], ACTION_TOKEN_LEN);
+            }
+            for (mode = 0; mode < ACTION_MODE_COUNT; mode++) {
+                for (i = 0; i < ARR_SZ(mouse_buttons); i++) {
+                    WritePrivateProfileString(TEXT("Input"), mouse_buttons[i].option[mode],
+                                              mouse_button_values[mode][i], inipath);
+                }
+                if (mode < 3) {
+                    for (i = 0; i < ARR_SZ(mouse_buttonsUP); i++) {
+                        WritePrivateProfileString(TEXT("Input"), mouse_buttonsUP[i].option[mode],
+                                                  mouse_button_up_values[mode][i], inipath);
+                    }
+                }
+                for (i = 0; i < ARR_SZ(mouse_wheels); i++) {
+                    WritePrivateProfileString(TEXT("Input"), mouse_wheels[i].option[mode],
+                                              mouse_wheel_values[mode][i], inipath);
+                }
             }
 
             // Checkboxes...
             WriteDialogOptions(hwnd, optlst, ARR_SZ(optlst));
             // Hotclicks
             SaveHotKeys(hotclicks, hwnd, TEXT("Hotclicks"));
+            if (!FinishConfigWrite(hwnd)) {
+                SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
             UpdateSettings();
             have_to_apply = 0;
         }
@@ -1456,6 +1514,7 @@ static INT_PTR CALLBACK KeyboardPageDialogProc(HWND hwnd, UINT msg, WPARAM wPara
         }
         // WRITE Current Keyboard Shortcut to ini file
         if (id == IDC_SHORTCUTS_SET) {
+            BeginConfigWrite();
             TCHAR txt[UINT_DIGITS+1], action_string_buf[64];
             // MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8
             GetDlgItemText(hwnd, IDC_SHORTCUTS_VK, txt, 3);
@@ -1616,6 +1675,7 @@ static INT_PTR CALLBACK KeyboardPageDialogProc(HWND hwnd, UINT msg, WPARAM wPara
             UpdateDialogStrings(hwnd, strlst, ARR_SZ(strlst));
 
         } else if (pnmh->code == PSN_APPLY && have_to_apply ) {
+            BeginConfigWrite();
             APPLY_ALL:;
 //            int i;
             // Action without click
@@ -1629,6 +1689,11 @@ static INT_PTR CALLBACK KeyboardPageDialogProc(HWND hwnd, UINT msg, WPARAM wPara
             // Hotkeys
             SaveHotKeys(hotkeys, hwnd, TEXT("Hotkeys"));
             WriteOptionBool(IDC_KEYCOMBO,  TEXT("Input"), "KeyCombo");
+            if (!FinishConfigWrite(hwnd)) {
+                if (msg == WM_NOTIFY)
+                    SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
             UpdateSettings();
             have_to_apply = 0;
         }
@@ -1715,8 +1780,13 @@ static INT_PTR CALLBACK BlacklistPageDialogProc(HWND hwnd, UINT msg, WPARAM wPar
                   ,  GetPrivateProfileInt(TEXT("KBShortcuts"), TEXT("Kill"), 0, inipath)
                   || GetPrivateProfileInt(TEXT("Advanced"), TEXT("ACMenuItems"), -1, inipath)&8192);
         } else if (pnmh->code == PSN_APPLY && have_to_apply) {
+            BeginConfigWrite();
             // Save to the config
             WriteDialogOptions(hwnd, optlst, ARR_SZ(optlst));
+            if (!FinishConfigWrite(hwnd)) {
+                SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
             UpdateSettings();
             have_to_apply = 0;
         }
@@ -1731,7 +1801,8 @@ static LRESULT CALLBACK FindWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         DWORD msgpos = GetMessagePos();
         POINT pt = { GET_X_LPARAM(msgpos), GET_Y_LPARAM(msgpos) };
         RECT fwRc;
-        HWND page = PropSheet_GetCurrentPageHwnd(g_cfgwnd);
+        HWND page = IsWindow(g_cfgwnd) ? PropSheet_GetCurrentPageHwnd(g_cfgwnd)
+                                       : g_wt_inline_page;
         HWND findHwnd = GetDlgItem(page, IDC_FINDWINDOW);
         GetWindowRect(findHwnd, &fwRc);
         if (PtInRect(&fwRc, pt))
@@ -1769,18 +1840,18 @@ static LRESULT CALLBACK FindWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // IDC_DWMCAPBUTTON
             RECT rc;
             SetDlgItemText(page, IDC_DWMCAPBUTTON
-                , (GetCaptionButtonsRect(window, &rc) && PtInRect(&rc, pt))?TEXT("Yes"):TEXT("No"));
+                , (GetCaptionButtonsRect(window, &rc) && PtInRect(&rc, pt))?TEXT("是"):TEXT("否"));
 
             // Window rectangle info
             if (GetWindowRectL(window, &rc)) {
                 SetDlgItemText(page, IDC_RECT, RectToStr(&rc, txt));
             }
             // IDC_WINHANDLES
-            lstrcpy_s( txt, ARR_SZ(txt), TEXT("Hwnd: ") );
+            lstrcpy_s( txt, ARR_SZ(txt), TEXT("窗口句柄: ") );
             lstrcat_s( txt, ARR_SZ(txt), LPTR2Hex(tt, (ULONG_PTR)nwindow) );
-            lstrcat_s( txt, ARR_SZ(txt), TEXT(", Root: ") );
+            lstrcat_s( txt, ARR_SZ(txt), TEXT(", 根窗口: ") );
             lstrcat_s( txt, ARR_SZ(txt), LPTR2Hex(tt, (ULONG_PTR)window) );
-            lstrcat_s( txt, ARR_SZ(txt), TEXT(", Owner: ") );
+            lstrcat_s( txt, ARR_SZ(txt), TEXT(", 所有者: ") );
             lstrcat_s( txt, ARR_SZ(txt), LPTR2Hex(tt, (ULONG_PTR)GetWindow(window, GW_OWNER)) );
             SetDlgItemText(page, IDC_WINHANDLES, txt);
         }
@@ -1814,17 +1885,10 @@ static INT_PTR CALLBACK AboutPageDialogProc(HWND hwnd, UINT msg, WPARAM wParam, 
             SetDlgItemText(hwnd, IDC_LICENSE,          l10n->AboutLicense);
             SetDlgItemText(hwnd, IDC_TRANSLATIONS_BOX, l10n->AboutTranslationCredit);
 
-            TCHAR txt[1024]; txt[0] = TEXT('\0');
-            if (langinfo.it) {
-                for (size_t i = 0; i < langinfo.num; i++) {
-                    lstrcat_s(txt, ARR_SZ(txt), langinfo.it[i].lang_english);
-                    lstrcat_s(txt, ARR_SZ(txt), TEXT(": "));
-                    lstrcat_s(txt, ARR_SZ(txt), langinfo.it[i].author);
-                    if (i + 1 != langinfo.num) {
-                        lstrcat_s(txt, ARR_SZ(txt), TEXT("\r\n"));
-                    }
-                }
-            }
+            TCHAR txt[1024];
+            lstrcpy_s(txt, ARR_SZ(txt), l10n->Lang);
+            lstrcat_s(txt, ARR_SZ(txt), TEXT(": "));
+            lstrcat_s(txt, ARR_SZ(txt), l10n->Author);
             SetDlgItemText(hwnd, IDC_TRANSLATIONS, txt);
         }
     }
@@ -2301,9 +2365,14 @@ static INT_PTR CALLBACK AdvancedPageDialogProc(HWND hwnd, UINT msg, WPARAM wPara
             UpdateDialogStrings(hwnd, strlst, ARR_SZ(strlst));
 
         } else if (pnmh->code == PSN_APPLY && have_to_apply) {
+            BeginConfigWrite();
             // Apply or OK button was pressed.
             // Save settings
             WriteDialogOptions(hwnd, optlst, ARR_SZ(optlst));
+            if (!FinishConfigWrite(hwnd)) {
+                SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
             UpdateSettings();
             // Update Test windows in if open.
             EnumThreadWindows(GetCurrentThreadId(), RefreshTestWin, 0);
@@ -2312,3 +2381,5 @@ static INT_PTR CALLBACK AdvancedPageDialogProc(HWND hwnd, UINT msg, WPARAM wPara
     }
     return FALSE;
 }
+
+
