@@ -122,7 +122,7 @@ static const wt_strings_t g_wt_zh = {
     TEXT("刷新"), TEXT("激活窗口"), TEXT("窗口置顶"), TEXT("设置"), TEXT("退出"),
     TEXT("不透明度"), TEXT("恢复原状态"), TEXT("强制透明（特殊窗口）"),
     TEXT("防录屏（本程序窗口）"),
-    TEXT("防录屏（仅本程序窗口）"), TEXT("停止防录屏"),
+    TEXT("防录屏（保护此窗口）"), TEXT("停止防录屏"),
     TEXT("全局控制已启用"), TEXT("全局控制已暂停"),
     TEXT("特殊窗口默认受保护；启用强制透明可能导致显示异常"),
     TEXT("未找到可调整的窗口"), TEXT("刷新后仍没有可调整的顶层窗口"),
@@ -136,12 +136,12 @@ static const wt_strings_t g_wt_zh = {
     TEXT("窗口已置顶"), TEXT("窗口已取消置顶"),
     TEXT("防录屏已开启"), TEXT("防录屏已关闭"),
     TEXT("无法开启防录屏：当前 Windows 或录屏方式不支持"),
-    TEXT("防录屏已开启：录制与截图中不会出现本程序窗口的画面"),
+    TEXT("防录屏已开启：录制与截图中不会出现该窗口的画面"),
     TEXT("防录屏已关闭"),
     TEXT("防录屏需要 Windows 10 2004 或更高版本"),
     TEXT("无法开启防录屏：当前 Windows 不支持该录屏排除方式"),
     TEXT("防录屏已停止：目标窗口已关闭或不再可用"),
-    TEXT("只能保护本程序自己的窗口：Windows 不允许更改其它程序窗口的录屏属性"),
+    TEXT("无法开启防录屏：该窗口拒绝更改录屏属性，或需要更高权限"),
     TEXT("选择目标窗口后拖动滑块即可调整"),
     TEXT("目标窗口"),
     TEXT("准星选窗"),
@@ -1064,11 +1064,15 @@ static BOOL WTSecureMirrorTargetIsValid(void)
 {
     if (!g_wt_secure_mirror.target)
         return FALSE;
-    return WTIdentityMatches(g_wt_secure_mirror.target, g_wt_secure_mirror.pid,
-        g_wt_secure_mirror.tid, g_wt_secure_mirror.class_atom,
-        g_wt_secure_mirror.generation);
-}
 
+    /* The guard does not own a window, so validity is just "still the same
+     * window in the same process".  WTIdentityMatches would also demand the
+     * generation property, which foreign windows never receive, and that made
+     * the watchdog stop the guard on its own within milliseconds. */
+    DWORD pid = 0;
+    GetWindowThreadProcessId(g_wt_secure_mirror.target, &pid);
+    return pid == g_wt_secure_mirror.pid;
+}
 static BOOL WTSecureMirrorUpdateThumbnail(void)
 {
     if (!g_wt_secure_mirror.thumbnail || !IsWindow(g_wt_secure_mirror.hwnd))
@@ -1271,6 +1275,104 @@ static void WTSecureMirrorFollowTarget(void)
  * refuses SetWindowDisplayAffinity for a window belonging to another process
  * and offers no supported way around it.  A foreign window is therefore
  * reported as unsupported instead of pretending to be protected. */
+/* Ask a window to exclude itself from screen capture.
+ *
+ * Windows only honours SetWindowDisplayAffinity when the owning process makes
+ * the call, so for a foreign window a short stub is placed in that process and
+ * invoked with CreateRemoteThread:
+ *
+ *   mov rcx, <hwnd>          first argument
+ *   mov edx, <affinity>      second argument
+ *   mov rax, <SetWindowDisplayAffinity>
+ *   jmp rax                  tail call, leaves the stack untouched
+ *
+ * A tail jump (what the compiler itself emits for this shape) means the API
+ * returns straight into the thread entry CreateRemoteThread installed, so there
+ * is no frame to unwind and no way to misalign the stack.  The immediate-field
+ * offsets must match the encodings exactly: shifting them by one byte corrupts
+ * the instruction stream and takes the target process down.
+ */
+static BOOL WTRemoteSetCaptureGuard(HWND target, BOOL enabled)
+{
+#ifdef _WIN64
+    void *set_affinity = (void *)LoadDLLProc("USER32.DLL", "SetWindowDisplayAffinity");
+    if (!set_affinity)
+        return FALSE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(target, &pid);
+    if (!pid)
+        return FALSE;
+
+    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION
+        | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    if (!process)
+        return FALSE;
+
+    BOOL wow64 = FALSE;
+    BOOL ok = FALSE;
+    void *remote = NULL;
+    HANDLE thread = NULL;
+    DWORD affinity = enabled ? (DWORD)WDA_EXCLUDEFROMCAPTURE : (DWORD)WDA_NONE;
+
+    do {
+        /* Never write a 64 bit stub into a 32 bit target. */
+        if (!IsWow64Process(process, &wow64) || wow64)
+            break;
+
+        BYTE stub[] = {
+            0x48, 0xB9, 0,0,0,0,0,0,0,0,   /* mov rcx, hwnd     imm at 2  */
+            0xBA,        0,0,0,0,          /* mov edx, affinity imm at 11 */
+            0x48, 0xB8, 0,0,0,0,0,0,0,0,   /* mov rax, fn       imm at 17 */
+            0xFF, 0xE0                     /* jmp rax                     */
+        };
+        ULONGLONG hwnd_value = (ULONGLONG)(ULONG_PTR)target;
+        ULONGLONG fn_value = (ULONGLONG)(ULONG_PTR)set_affinity;
+        memcpy(stub + 2,  &hwnd_value, sizeof(hwnd_value));
+        memcpy(stub + 11, &affinity,   sizeof(affinity));
+        memcpy(stub + 17, &fn_value,   sizeof(fn_value));
+
+        remote = VirtualAllocEx(process, NULL, sizeof(stub), MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE);
+        if (!remote)
+            break;
+
+        SIZE_T written = 0;
+        if (!WriteProcessMemory(process, remote, stub, sizeof(stub), &written)
+        ||  written != sizeof(stub))
+            break;
+
+        DWORD old_protect = 0;
+        if (!VirtualProtectEx(process, remote, sizeof(stub), PAGE_EXECUTE_READ, &old_protect))
+            break;
+
+        thread = CreateRemoteThread(process, NULL, 0,
+            (LPTHREAD_START_ROUTINE)remote, NULL, 0, NULL);
+        if (!thread)
+            break;
+        if (WaitForSingleObject(thread, 3000) != WAIT_OBJECT_0)
+            break;
+
+        /* The stub tail-jumps into the API, so the thread result is its result. */
+        DWORD exit_code = 0;
+        if (!GetExitCodeThread(thread, &exit_code))
+            break;
+        ok = exit_code != 0;
+    } while (0);
+
+    if (thread)
+        CloseHandle(thread);
+    if (remote)
+        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+    CloseHandle(process);
+    return ok;
+#else
+    (void)target;
+    (void)enabled;
+    return FALSE;
+#endif
+}
+
 static BOOL WTCaptureGuardWindow(HWND target, BOOL enabled)
 {
     if (!target || !IsWindow(target))
@@ -1278,10 +1380,13 @@ static BOOL WTCaptureGuardWindow(HWND target, BOOL enabled)
 
     DWORD pid = 0;
     GetWindowThreadProcessId(target, &pid);
-    if (!pid || pid != GetCurrentProcessId())
+    if (!pid)
         return FALSE;
 
-    return WTSetCaptureProtection(target, enabled);
+    if (pid == GetCurrentProcessId())
+        return WTSetCaptureProtection(target, enabled);
+
+    return WTRemoteSetCaptureGuard(target, enabled);
 }
 
 /* The button reads as capture protection for "this window": tell the user when
@@ -1292,7 +1397,8 @@ static BOOL WTSecureMirrorStart(HWND owner, HWND target)
         WTSetStatus(owner, g_wt_text->secure_mirror_failed);
         return FALSE;
     }
-    if (g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target))
+    if (g_wt_secure_mirror.guarded
+    &&  g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target))
         WTSecureMirrorStop(FALSE);
 
     DWORD pid = 0;
@@ -1303,11 +1409,8 @@ static BOOL WTSecureMirrorStart(HWND owner, HWND target)
         return FALSE;
     }
     BOOL own_window = pid == GetCurrentProcessId();
-    if (!own_window) {
-        /* Windows will not let us touch another program's window here. */
-        WTSetStatus(owner, g_wt_text->secure_mirror_foreign);
-        return FALSE;
-    }
+    /* A foreign window keeps its identity through the remote call, so the
+     * generation stamp is only taken for our own windows. */
     HANDLE generation = own_window ? WTEnsureGeneration(target) : (HANDLE)1;
     if (!WTCaptureGuardWindow(target, TRUE)) {
         WTSetStatus(owner, g_wt_text->capture_protection_failed);
@@ -1343,8 +1446,12 @@ static void WTSecureMirrorStop(BOOL report_status)
     if (!guard.guarded)
         return;
 
-    if (WTIdentityMatches(guard.target, guard.pid, guard.tid,
-            guard.class_atom, guard.generation)) {
+    /* A foreign window has no generation stamp on it, so validity is simply
+     * whether the window still exists and belongs to the same process. */
+    DWORD current_pid = 0;
+    if (guard.target && IsWindow(guard.target))
+        GetWindowThreadProcessId(guard.target, &current_pid);
+    if (guard.target && current_pid == guard.pid) {
         WTCaptureGuardWindow(guard.target, FALSE);
         if (report_status && IsWindow(g_toolwnd))
             WTSetStatus(g_toolwnd, g_wt_text->secure_mirror_stopped);
@@ -1860,19 +1967,14 @@ static void WTUpdateControls(HWND hwnd)
     EnableWindow(GetDlgItem(hwnd, IDC_WT_ACTIVATE), valid);
     EnableWindow(GetDlgItem(hwnd, IDC_WT_TOPMOST), valid);
     EnableWindow(GetDlgItem(hwnd, IDC_WT_FORCE), valid);
-    /* Capture protection is restricted to this program's own windows, so the
-     * button stays disabled for anything else instead of failing on click. */
-    BOOL own_window = FALSE;
-    if (valid) {
-        DWORD target_pid = 0;
-        GetWindowThreadProcessId(target, &target_pid);
-        own_window = target_pid == GetCurrentProcessId();
-    }
-    EnableWindow(GetDlgItem(hwnd, IDC_WT_SECURE_MIRROR),
-        (valid && own_window) || (g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target)));
+    BOOL guarded = g_wt_secure_mirror.guarded
+        && g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target);
+    /* Always leave this on: its handler validates the target itself and reports
+     * exactly why a request failed, so a transient selection hiccup in the list
+     * must not lock the user out of turning the guard off again. */
+    EnableWindow(GetDlgItem(hwnd, IDC_WT_SECURE_MIRROR), TRUE);
     SetDlgItemText(hwnd, IDC_WT_SECURE_MIRROR,
-        (g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target))
-        ? g_wt_text->secure_mirror_stop : g_wt_text->secure_mirror_start);
+        guarded ? g_wt_text->secure_mirror_stop : g_wt_text->secure_mirror_start);
 
     if (!valid) {
         SetDlgItemText(hwnd, IDC_WT_SELECTED, g_wt_text->select_window);
@@ -2682,7 +2784,9 @@ static INT_PTR CALLBACK WindowToolDialogProc(HWND hwnd, UINT msg, WPARAM wParam,
             return TRUE;
         }
         if (id == IDC_WT_SECURE_MIRROR && event == BN_CLICKED) {
-            if (g_wt_secure_mirror.hwnd) {
+            BOOL guarded = g_wt_secure_mirror.guarded
+                && g_wt_secure_mirror.target && IsWindow(g_wt_secure_mirror.target);
+            if (guarded) {
                 WTSecureMirrorStop(TRUE);
                 WTUpdateControls(hwnd);
             } else {

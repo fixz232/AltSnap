@@ -1,59 +1,39 @@
-English | [中文](./README_zh-CN.md) | [한국어](./README_ko-KR.md)
-# AltSnap
-Fork from Stefan Sundin's AltDrag.
+# 圣子猫透明工具
 
-Check the Wiki: https://github.com/RamonUnch/AltSnap/wiki
+基于 [RamonUnch/AltSnap](https://github.com/RamonUnch/AltSnap) 的 Windows 窗口透明度与窗口管理工具。它将透明度面板与 AltSnap 的窗口移动、缩放、吸附和快捷动作整合为一个可便携运行的原生 Win32 程序。
 
-Original documentation: https://stefansundin.github.io/altdrag/doc/
+## 功能
 
-Note that the documentation is not 100% accurate because it is a fork.
-Read the changelog for more details.
+- **窗口选择与实时透明度**：通过窗口列表或准星选择目标窗口，使用滑块即时调整不透明度，并可一键恢复本次修改前的状态。
+- **常用窗口控制**：快速激活窗口、切换置顶；默认可用 `Alt + 滚轮` 调整透明度。
+- **全局窗口操作**：保留 AltSnap 的移动、缩放、吸附、最大化、暂停和快捷动作等能力，详细选项可在工具内设置。
+- **特殊窗口处理**：对常规方式无法调整的分层窗口提供“强制透明”选项；该选项可能影响目标窗口显示，默认保持关闭。
+- **简体中文与高 DPI**：主面板、设置页和通知区域交互均使用简体中文，并采用原生控件与高 DPI 布局。
+- **屏幕采集排除（实验性）**：可为当前选中的窗口尝试请求 Windows 显示亲和性保护。处理第三方窗口时，工具会申请相应进程权限并在目标进程上下文中调用系统 API；部分程序、权限级别或录制工具可能拒绝、忽略或出现兼容性问题。
 
-It allows you to move and resize windows by using the Alt key and clicking wherever on the window instead of relying on very precise clicking.
-This behavior is very common on Linux distributions and is not actually hard to implement on Windows.
+## 使用方式
 
-This fork tries to keep a version up to date with minimal amount of bugs while keeping it feature-rich.
+1. 启动程序后，在窗口列表中选择目标窗口，或点击“准星选窗”。
+2. 使用“不透明度”滑块进行调整；需要撤销时点击“恢复原状态”。
+3. 对受保护的分层窗口，确认显示效果可接受后再启用“强制透明（特殊窗口）”。
+4. 更多窗口操作、鼠标动作和快捷键可在“设置”中配置。
 
-It is oriented towards all Windows users from Windows NT 4 to Windows 11, even though it is mostly tested on Windows XP and Windows 10.
+程序目录可写时，配置保存在程序旁的 `圣子猫透明工具.ini`；否则保存在 `%APPDATA%\圣子猫透明工具\圣子猫透明工具.ini`。
 
-Main differences:
-To simplify the code greatly the Hooks windows feature was removed, it allowed you have windows snapping while dragging them normally. It required however to inject a dll in every application and induced thus an obvious security risk. The amount of mess added to the code just for this feature was substantial and in addition forced to have both a 32bits and a 64bits version of the program running at the same time.
+## 构建
 
-This version injects nothing into other applications. This means you do not have to worry whether you have a 32 or a 64bit operating system.
+项目沿用 AltSnap 的 C / MinGW-w64 构建流程：
 
-Another feature that was disabled is focus on typing, that was too much unusable for me to even start testing, so I removed it.
+- `make`：i386 Win32 构建。
+- `make -fMakefileX64`：x86_64 构建。
+- `make -fMakefileX64db`：x86_64 调试构建。
+- `mkmsvc.bat`：Microsoft Visual C++ 构建。
 
-Otherwise this has a much simpler source code, added a few extra options, such as transparent windows dragging, Maximize action, pause process options, more blacklists for finer control of AltSnap etc.
+## 项目声明
 
-Finally it fixed a ton of undesired behavior and bugs from the original AltDrag.
+- 本仓库是 AltSnap 的派生 Fork，不是 AltSnap 官方发行版，也不代表或获得上游作者背书。
+- 上游来源为 [RamonUnch/AltSnap](https://github.com/RamonUnch/AltSnap)，其历史源自 Stefan Sundin 的 AltDrag。
+- 本项目及其派生版本遵循 GNU General Public License v3.0 or later；再发布时请保留 `License.txt`、对应源码和来源说明。
+- 软件按“现状”提供。请仅对拥有或获授权管理的窗口使用；部分第三方程序、提升权限窗口或特殊渲染窗口可能拒绝透明度、置顶或屏幕采集排除操作。
 
-WHAT'S NEW
-
-Many new features can be seen in the option dialog box, however some of them are only available through editing the AltSnap.ini file (middle click on tyhe tray icon for this).
-
-# VirusTotal false positive
-You will see with the latest builds that there are some alerts, usually from SecureAge APEX and sometimes from other vendors. Those are false positives, and I stopped contacting the APEX team for every release because it is a waste of time I would rather spend on improving the program.
-I already reduced the number of false positives significantly, simply by changing build flags and by switching to an older version of the NSIS installer system. This is an indication of the impertinence of some modern antivirus solutions. Chocolatey considers that up to five positives on VirusTotal is not even suspicious.
-
-# Build
-AltSnap builds with gcc + MinGW-w64
-Just install the latest version (I use TDM-gcc 10.3, MinGW64 based)
-You can also use GCC from [winlibs.com](https://winlibs.com/)
-
-`> make` for i386 Win32 GCC build.
-
-`> make -fMakefiledb` for i386 GCC debug build.
-
-`> make -fMakefileX64` for x86_64 GCC build.
-
-`> make -fMakefileX64db` for x86_64 GCC debug build.
-
-`> make -fMakefileClang` for i386 build using LLVM Clang.
-
-`> make -fMakefileTCC` for i386 build using tcc, [Bellard's thiny c compiler](https://bellard.org/tcc/)
-
-`> make -fMakefileARM64Docker` for ARM64 Windows build using Docker (see [BUILD_ARM64.md](BUILD_ARM64.md))
-
-`> mkmsvc.bat` for builds with Microsoft Visual Studio (CL.EXE).
-
-For Visual Studio you can setup a console environement using the  VsDevCmd.bat command with the `-arch` and `-host_arch` parameters to your needs.
+完整的来源、许可证、使用限制与安全边界请参阅 [NOTICE.md](NOTICE.md)。

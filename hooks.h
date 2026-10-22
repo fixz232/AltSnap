@@ -343,3 +343,4 @@ void assertions(void)
 }
 
 #endif /* ALTDRAG_RPC_H */
+
