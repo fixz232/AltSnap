@@ -71,7 +71,8 @@ typedef struct wt_strings {
     const TCHAR *opacity;
     const TCHAR *restore;
     const TCHAR *force_transparency;
-    const TCHAR *capture_protection;
+    const TCHAR *capture_protection_enable;
+    const TCHAR *capture_protection_disable;
     const TCHAR *secure_mirror_start;
     const TCHAR *secure_mirror_stop;
     const TCHAR *global_enabled;
@@ -121,7 +122,7 @@ static const wt_strings_t g_wt_zh = {
     { TEXT("窗口"), TEXT("程序"), TEXT("不透明度"), TEXT("置顶") },
     TEXT("刷新"), TEXT("激活窗口"), TEXT("窗口置顶"), TEXT("设置"), TEXT("退出"),
     TEXT("不透明度"), TEXT("恢复原状态"), TEXT("强制透明（特殊窗口）"),
-    TEXT("防录屏（本程序窗口）"),
+    TEXT("开启本软件防录屏"), TEXT("关闭本软件防录屏"),
     TEXT("防录屏（保护此窗口）"), TEXT("停止防录屏"),
     TEXT("全局控制已启用"), TEXT("全局控制已暂停"),
     TEXT("特殊窗口默认受保护；启用强制透明可能导致显示异常"),
@@ -134,7 +135,7 @@ static const wt_strings_t g_wt_zh = {
     TEXT("没有可恢复的状态，或目标窗口需要更高权限"),
     TEXT("置顶修改失败，目标窗口可能需要更高权限"),
     TEXT("窗口已置顶"), TEXT("窗口已取消置顶"),
-    TEXT("防录屏已开启"), TEXT("防录屏已关闭"),
+    TEXT("本软件窗口防录屏已开启"), TEXT("本软件窗口防录屏已关闭"),
     TEXT("无法开启防录屏：当前 Windows 或录屏方式不支持"),
     TEXT("防录屏已开启：录制与截图中不会出现该窗口的画面"),
     TEXT("防录屏已关闭"),
@@ -169,7 +170,7 @@ static TCHAR g_wt_generation_property[64];
 static const wt_strings_t *g_wt_text = &g_wt_zh;
 static HWND g_wt_force_target = NULL;
 static BOOL g_wt_force_enabled = FALSE;
-static BOOL g_wt_capture_protection = TRUE;
+static BOOL g_wt_capture_protection = FALSE;
 static HICON g_wt_icon_big = NULL;
 static HICON g_wt_icon_small = NULL;
 
@@ -1034,9 +1035,8 @@ static void WTPaintPanel(HWND hwnd)
 }
 
 static BOOL WTReadCaptureProtection(void)
-
 {
-    return GetPrivateProfileInt(TEXT("General"), TEXT("CaptureProtection"), 1, inipath) != 0;
+    return GetPrivateProfileInt(TEXT("General"), TEXT("CaptureProtection"), 0, inipath) != 0;
 }
 
 static BOOL WTSetCaptureProtection(HWND hwnd, BOOL enabled)
@@ -2097,7 +2097,8 @@ static void WTApplyLanguage(HWND hwnd)
     SetDlgItemText(hwnd, IDC_WT_OPACITY_LABEL, g_wt_text->opacity);
     SetDlgItemText(hwnd, IDC_WT_RESET, g_wt_text->restore);
     SetDlgItemText(hwnd, IDC_WT_FORCE, g_wt_text->force_transparency);
-    SetDlgItemText(hwnd, IDC_WT_CAPTURE_PROTECTION, g_wt_text->capture_protection);
+    SetDlgItemText(hwnd, IDC_WT_CAPTURE_PROTECTION, g_wt_capture_protection
+        ? g_wt_text->capture_protection_disable : g_wt_text->capture_protection_enable);
     SetDlgItemText(hwnd, IDC_WT_SECURE_MIRROR, g_wt_secure_mirror.hwnd
         ? g_wt_text->secure_mirror_stop : g_wt_text->secure_mirror_start);
 
@@ -2275,7 +2276,8 @@ static void WTLayout(HWND hwnd)
     t->mirror_w = WTControlWidth(hwnd, g_wt_text->secure_mirror_start, 150, 26);
     t->topmost_w = WTControlWidth(hwnd, g_wt_text->topmost, 56, 20);
     t->force_w = WTControlWidth(hwnd, g_wt_text->force_transparency, 116, 20);
-    t->capture_w = WTControlWidth(hwnd, g_wt_text->capture_protection, 116, 20);
+    t->capture_w = max(WTControlWidth(hwnd, g_wt_text->capture_protection_enable, 116, 26),
+        WTControlWidth(hwnd, g_wt_text->capture_protection_disable, 116, 26));
 
     /* ---- window list card ------------------------------------------- */
     int left = t->card1_rect.left + inner;
@@ -2332,9 +2334,9 @@ static void WTLayout(HWND hwnd)
     MoveWindow(GetDlgItem(hwnd, IDC_WT_FORCE), check_x, checks_y, t->force_w, WTS(22), TRUE);
     check_x += t->force_w + WTS(16);
     MoveWindow(GetDlgItem(hwnd, IDC_WT_CAPTURE_PROTECTION), check_x, checks_y,
-        t->capture_w, WTS(22), TRUE);
+        t->capture_w, WTS(28), TRUE);
 
-    int actions_y = checks_y + WTS(22) + WTS(8);
+    int actions_y = checks_y + WTS(28) + WTS(8);
     MoveWindow(GetDlgItem(hwnd, IDC_WT_ACTIVATE), left, actions_y,
         t->activate_w, WTS(28), TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_WT_SECURE_MIRROR), left + t->activate_w + WTS(8), actions_y,
@@ -2552,8 +2554,6 @@ static INT_PTR CALLBACK WindowToolDialogProc(HWND hwnd, UINT msg, WPARAM wParam,
             MAKELPARAM(WT_MIN_OPACITY, 100));
         SendDlgItemMessage(hwnd, IDC_WT_OPACITY, TBM_SETTICFREQ, 10, 0);
         SendDlgItemMessage(hwnd, IDC_WT_OPACITY, TBM_SETPAGESIZE, 0, 10);
-        CheckDlgButton(hwnd, IDC_WT_CAPTURE_PROTECTION,
-            g_wt_capture_protection ? BST_CHECKED : BST_UNCHECKED);
         WTSetControlFonts(hwnd);
         WTApplyListMetrics(hwnd);
         WTAddPickerTooltip(hwnd);
@@ -2772,13 +2772,15 @@ static INT_PTR CALLBACK WindowToolDialogProc(HWND hwnd, UINT msg, WPARAM wParam,
             return TRUE;
         }
         if (id == IDC_WT_CAPTURE_PROTECTION && event == BN_CLICKED) {
-            BOOL enabled = IsDlgButtonChecked(hwnd, IDC_WT_CAPTURE_PROTECTION) == BST_CHECKED;
+            BOOL enabled = !g_wt_capture_protection;
             if (WTSaveCaptureProtection(hwnd, enabled)) {
+                SetDlgItemText(hwnd, IDC_WT_CAPTURE_PROTECTION, enabled
+                    ? g_wt_text->capture_protection_disable : g_wt_text->capture_protection_enable);
                 WTSetStatus(hwnd, enabled ? g_wt_text->capture_protection_on
                     : g_wt_text->capture_protection_off);
             } else {
-                CheckDlgButton(hwnd, IDC_WT_CAPTURE_PROTECTION,
-                    g_wt_capture_protection ? BST_CHECKED : BST_UNCHECKED);
+                SetDlgItemText(hwnd, IDC_WT_CAPTURE_PROTECTION, g_wt_capture_protection
+                    ? g_wt_text->capture_protection_disable : g_wt_text->capture_protection_enable);
                 WTSetStatus(hwnd, g_wt_text->capture_protection_failed);
             }
             return TRUE;
